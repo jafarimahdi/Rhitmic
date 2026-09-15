@@ -232,6 +232,9 @@ class MarketSnapshot:
     regime: str = "NEUTRAL"           # "TREND" | "RANGE" | "NEUTRAL"
     divergence: float = 0.0           # +1 bullish / -1 bearish CVD divergence
     mtf_trends: Dict[str, str] = field(default_factory=dict)  # {"H1":"UP","M15":"DOWN","M5":"UP"}
+    # v4.1: higher-timeframe Points of Control — the 1h and 4h volume magnets
+    # the big timeframe players trade around ("POC in the bigger candles")
+    htf_poc: Dict[str, float] = field(default_factory=dict)  # {"H1": 4352.5, "H4": 4348.0}
     spread_pct: float = 0.0           # bid-ask spread as % of price (0 = unknown)
     order_blocks: List[Dict] = field(default_factory=list)  # supply/demand zones
     nearest_support: float = 0.0      # nearest demand zone bottom below price
@@ -2128,6 +2131,13 @@ def analyze_market(market_data: Dict[str, Any],
     else:
         notes.append("insufficient candle data -> technicals defaulted")
 
+    # visibility: a shallow candle history silently disables ATR, MTF,
+    # order blocks and HTF POC — say so, so it is obvious when it heals
+    if 2 <= len(close) < 60:
+        notes.append(f"candle history shallow ({len(close)} M1 bars) — "
+                     f"ATR/MTF/order blocks/HTF POC limited until the "
+                     f"window fills")
+
     # ---- Level 2 depth analytics (OFI / microprice / imbalance / absorption) -
     # Uses a PERSISTENT analyzer so OFI and absorption have a previous book to
     # compare against (a fresh analyzer each cycle would always see OFI == 0).
@@ -2211,6 +2221,23 @@ def analyze_market(market_data: Dict[str, Any],
         order_blocks = _detect_order_blocks(high, low, close, open_)
         nearest_support, nearest_resistance = _nearest_zones(order_blocks, price)
 
+    # ---- v4.1: higher-timeframe POC (trailing 1h / 4h volume profiles) -------
+    # The session POC above is computed over the whole data window; these are
+    # the volume magnets of the BIGGER timeframes the user asked for: POC of
+    # the trailing 60 M1 bars (H1 profile) and 240 M1 bars (H4 profile).
+    # H4 needs ~4h of window (NT_WINDOW_SECONDS=28800 provides 8h).
+    htf_poc: Dict[str, float] = {}
+    try:
+        _vpa = VolumeProfileAnalyzer()
+        for _tf, _n in (("H1", 60), ("H4", 240)):
+            if len(close) >= _n:
+                _p, _vh, _vl = _vpa.compute_poc_and_value_area(
+                    high[-_n:], low[-_n:], vol[-_n:])
+                if _p > 0:
+                    htf_poc[_tf] = float(_p)
+    except Exception:
+        htf_poc = {}
+
     # ---- v3 structure: Asian range + recent closes ----------------------------
     asia_range = _asian_range_state(tick_data, price, now)
     if asia_range:
@@ -2236,6 +2263,7 @@ def analyze_market(market_data: Dict[str, Any],
         mtf_trends=mtf_trends, spread_pct=spread_pct,
         order_blocks=order_blocks, nearest_support=nearest_support,
         nearest_resistance=nearest_resistance,
+        htf_poc=htf_poc,
         symbol=symbol,
         data_symbol=str(market_data.get("data_symbol") or symbol),
         trade_symbol=str(market_data.get("trade_symbol") or ""),

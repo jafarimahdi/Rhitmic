@@ -788,6 +788,17 @@ def run_pipeline() -> None:
         if snapshot is not None:
             snapshot.notes.append(gate_reason)
 
+    # STEP 4a: manage any OPEN positions with the fresh market data (v4).
+    # Runs before new entries so a flip-exit frees the slot in the same
+    # cycle. Management only ever reduces risk (tighten/BE/close) and must
+    # never break the pipeline — all errors are contained.
+    if snapshot is not None:
+        try:
+            from position_manager import get_position_manager
+            get_position_manager().manage(snapshot)
+        except Exception:
+            logger.exception("position manager failed (non-fatal)")
+
     # STEP 4
     exec_result = None
     if decision is not None:

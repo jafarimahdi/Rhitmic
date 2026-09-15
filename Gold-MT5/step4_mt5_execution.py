@@ -153,6 +153,23 @@ class MT5Executor:
             return ExecutionResult(status="ERROR", reason="MT5 init failed",
                                    symbol=self.symbol, timestamp=now)
 
+        # --- gate 4b: account type guard ----------------------------------------
+        # The demo phase must never leak onto a real-money account by accident
+        # (the terminal logs into whatever account was last used). Refuse to
+        # trade REAL accounts unless ALLOW_LIVE_TRADING=1 in .env.
+        account = mt5.account_info()
+        trade_mode = getattr(account, "trade_mode", None)
+        real_mode = getattr(mt5, "ACCOUNT_TRADE_MODE_REAL", 2)
+        if trade_mode == real_mode and not getattr(config, "ALLOW_LIVE_TRADING", False):
+            logger.error(
+                "STEP 4: REAL (live) account detected — refusing to trade. "
+                "Log the MT5 terminal into the DEMO account, or set "
+                "ALLOW_LIVE_TRADING=1 in .env if this is intentional.")
+            return ExecutionResult(
+                status="ERROR",
+                reason="real account blocked (ALLOW_LIVE_TRADING=0)",
+                symbol=self.symbol, timestamp=now)
+
         try:
             return self._place_order(decision.action, snapshot, news_state)
         finally:
@@ -381,6 +398,19 @@ class MT5Executor:
             return ExecutionResult(status="ERROR", reason="symbol info unavailable",
                                    symbol=self.symbol, price=price, timestamp=now)
 
+        # CFD spread guard: main.py's spread gate watches the DATA feed
+        # (futures bid/ask); this checks the actual broker spread on the trade
+        # symbol right before ordering. A wide spread is an instant edge loss.
+        if config.MAX_SPREAD_PCT > 0 and tick.bid > 0 and tick.ask > 0:
+            cfd_spread_pct = (tick.ask - tick.bid) / tick.bid * 100.0
+            if cfd_spread_pct > config.MAX_SPREAD_PCT:
+                reason = (f"CFD spread too wide: {cfd_spread_pct:.3f}% > "
+                          f"{config.MAX_SPREAD_PCT:.3f}% — DEFERRED")
+                logger.warning("STEP 4: %s", reason)
+                return ExecutionResult(status="DEFERRED", reason=reason,
+                                       symbol=self.symbol, price=price,
+                                       timestamp=now)
+
         # Position ownership: same direction is idempotent; opposite bot
         # positions are closed before the new direction is opened. Positions
         # with another magic number (including manual trades) are untouched.
@@ -426,7 +456,19 @@ class MT5Executor:
             price * 0.005  # 0.5% fallback
         src_price = getattr(snapshot, "price", 0.0) or price
         atr = src_atr * (price / src_price) if src_price > 0 else src_atr
-        sl, tp = self._calc_sl_tp(action, price, atr, news_state)
+        # v4: structural stops — SL behind demand/supply zones (order blocks),
+        # POC or strong round numbers; TP in front of opposing structure.
+        # Falls back to the old ATR multiples when no structure exists.
+        try:
+            from position_manager import compute_structural_stops
+            sl, tp, struct_notes = compute_structural_stops(
+                action, price, atr, snapshot, news_state)
+            if struct_notes:
+                logger.info("STEP 4: structural stops: %s",
+                            "; ".join(struct_notes))
+        except Exception:
+            logger.exception("structural stops failed — ATR fallback")
+            sl, tp = self._calc_sl_tp(action, price, atr, news_state)
         stop_error = self._validate_stops(action, price, sl, tp, info)
         if stop_error:
             logger.error("STEP 4: %s", stop_error)

@@ -130,6 +130,10 @@ def _refresh() -> None:
     #   ea     = Python writes actionable signals; only the MQL5 EA trades
     mode = _fget("EXECUTION_MODE", "none").strip().lower()
     g["EXECUTION_MODE"] = mode if mode in ("none", "python", "ea") else "none"
+    # Refuse to place orders on a REAL account unless explicitly allowed.
+    # Demo/contest accounts are always fine. Keep 0 until going live is a
+    # deliberate, reviewed decision.
+    g["ALLOW_LIVE_TRADING"] = _fget("ALLOW_LIVE_TRADING", "0") == "1"
 
     # ---- STEP 2 analysis parameters ----------------------------------------
     g["PRICE_RESOLUTION"] = _ffloat("PRICE_RESOLUTION", 0.1)
@@ -187,6 +191,77 @@ def _refresh() -> None:
     g["NEWS_BLACKOUT_AFTER_MINUTES"] = _ffloat("NEWS_BLACKOUT_AFTER_MINUTES", 30.0)
     g["NEWS_WIDEN_STOP_MULT"] = _ffloat("NEWS_WIDEN_STOP_MULT", 1.5)
     g["NEWS_REDUCE_SIZE_PCT"] = _ffloat("NEWS_REDUCE_SIZE_PCT", 0.5)
+
+    # ---- v4 position manager (trade management while a position is open) ----
+    # PM runs every loop cycle: it adopts the bot's open positions (magic
+    # 234000 only), tightens far stops, moves to break-even, trails behind
+    # structure and can close early on signal flips. Set PM_ENABLE=0 to get
+    # the old open-and-forget behaviour back.
+    g["PM_ENABLE"] = _fget("PM_ENABLE", "1") == "1"
+    # move SL to break-even once profit reaches this multiple of initial risk
+    g["PM_BE_TRIGGER_R"] = _ffloat("PM_BE_TRIGGER_R", 1.0)
+    # trail the SL behind fresh demand/supply zones + POC (tighten only)
+    g["PM_TRAIL_ENABLE"] = _fget("PM_TRAIL_ENABLE", "1") == "1"
+    # close early when the composite signal flips this hard against us ...
+    g["PM_FLIP_EXIT_SCORE"] = _ffloat("PM_FLIP_EXIT_SCORE", 55.0)
+    # ... but only when order flow (delta/pressure) agrees (1) or not (0)
+    g["PM_FLIP_REQUIRE_FLOW"] = _fget("PM_FLIP_REQUIRE_FLOW", "1") == "1"
+    # close when CVD diverges against the position while it is still early
+    g["PM_DIVERGENCE_EXIT"] = _fget("PM_DIVERGENCE_EXIT", "1") == "1"
+    g["PM_DIVERGENCE_MIN_R"] = _ffloat("PM_DIVERGENCE_MIN_R", 0.3)
+    # close positions older than N minutes that travelled < P of the TP leg
+    g["PM_TIME_STOP_MINUTES"] = _fint("PM_TIME_STOP_MINUTES", 90)
+    g["PM_TIME_STOP_MIN_PROGRESS"] = _ffloat("PM_TIME_STOP_MIN_PROGRESS", 0.2)
+    # structural stop distances are clamped to [min, max] x ATR — this is
+    # what stops the "SL too far" problem (old blind 1.5xATR stops)
+    g["PM_MIN_SL_ATR"] = _ffloat("PM_MIN_SL_ATR", 1.2)
+    g["PM_MAX_SL_ATR"] = _ffloat("PM_MAX_SL_ATR", 3.0)
+    # buffer beyond a zone for the SL, and how far in front of opposing
+    # structure the TP parks
+    g["PM_ZONE_BUFFER_ATR"] = _ffloat("PM_ZONE_BUFFER_ATR", 0.25)
+    g["PM_TP_BUFFER_ATR"] = _ffloat("PM_TP_BUFFER_ATR", 0.15)
+    # keep this much clearance from strong round numbers (hunt protection)
+    g["PM_ROUND_HUNT_BUFFER_ATR"] = _ffloat("PM_ROUND_HUNT_BUFFER_ATR", 0.12)
+    # TP distance clamps in ATR multiples
+    g["PM_TP_MIN_ATR"] = _ffloat("PM_TP_MIN_ATR", 1.0)
+    g["PM_TP_MAX_ATR"] = _ffloat("PM_TP_MAX_ATR", 4.0)
+    # minimum seconds between SL/TP modifications of the same position
+    g["PM_MODIFY_COOLDOWN_SECONDS"] = _fint("PM_MODIFY_COOLDOWN_SECONDS", 180)
+
+    # ---- v4.1 in-trade intelligence ----
+    # H1/H4 Points of Control join the anchor pool ("POC in bigger candles")
+    g["PM_HTF_POC_ENABLE"] = _fget("PM_HTF_POC_ENABLE", "1") == "1"
+    # footprint stacked-imbalance clusters act as fresh zones: one side must
+    # dominate by this ratio over N consecutive prices, with real volume
+    g["PM_FP_ZONES_ENABLE"] = _fget("PM_FP_ZONES_ENABLE", "1") == "1"
+    g["PM_FP_IMB_RATIO"] = _ffloat("PM_FP_IMB_RATIO", 3.0)
+    g["PM_FP_MIN_RUN"] = _fint("PM_FP_MIN_RUN", 3)
+    # flow health: if price moves in our favour but CVD disagrees, the
+    # break-even trigger drops to this multiple of risk (protect early)
+    g["PM_FLOW_ENABLE"] = _fget("PM_FLOW_ENABLE", "1") == "1"
+    g["PM_FLOW_LOOKBACK_MINUTES"] = _fint("PM_FLOW_LOOKBACK_MINUTES", 5)
+    g["PM_FLOW_WEAK_BE_R"] = _ffloat("PM_FLOW_WEAK_BE_R", 0.5)
+    # VWAP regime: z-score that marks "trend side" (trail behind VWAP) and
+    # "stretched" (lock half the gain); buffer for the VWAP trail stop
+    g["PM_VWAP_ENABLE"] = _fget("PM_VWAP_ENABLE", "1") == "1"
+    g["PM_VWAP_TREND_Z"] = _ffloat("PM_VWAP_TREND_Z", 0.5)
+    g["PM_VWAP_STRETCH_Z"] = _ffloat("PM_VWAP_STRETCH_Z", 2.0)
+    g["PM_VWAP_TRAIL_BUFFER_ATR"] = _ffloat("PM_VWAP_TRAIL_BUFFER_ATR", 0.25)
+
+    # ---- v4.2 risk perimeter ----
+    # news protection: when a HIGH-impact event (CPI/NFP/FOMC) is this many
+    # minutes away: "tighten" locks gains on profitable positions (losers
+    # keep their structural stop); "flatten" closes everything pre-release
+    g["PM_NEWS_PROTECT_ENABLE"] = _fget("PM_NEWS_PROTECT_ENABLE", "1") == "1"
+    g["PM_NEWS_PROTECT_MINUTES"] = _ffloat("PM_NEWS_PROTECT_MINUTES", 10.0)
+    g["PM_NEWS_PROTECT_MODE"] = _fget("PM_NEWS_PROTECT_MODE", "tighten")
+    # daily flatten: close ALL bot positions at this UTC time, BEFORE the
+    # XAUUSD CFD break (~22:00 UTC) — a gap can jump straight over a stop.
+    # This also covers the weekend (Friday). "" disables.
+    g["PM_DAILY_FLATTEN_UTC"] = _fget("PM_DAILY_FLATTEN_UTC", "21:30")
+    # never donate the spread: postpone SL/TP edits and non-urgent closes
+    # while the CFD spread exceeds this percentage (news seconds)
+    g["PM_ACTION_MAX_SPREAD_PCT"] = _ffloat("PM_ACTION_MAX_SPREAD_PCT", 0.05)
 
     # ---- live news headlines (fed to the AI so it can weigh fundamentals) ----
     # FREE via Google News RSS — no key, no card needed. 0 disables it.
@@ -271,6 +346,10 @@ def _refresh() -> None:
     # Live CME gold L1+L2 from the GoldBridgeExporter indicator's ticks.csv.
     g["NT_BRIDGE_FILE"] = _fget("NT_BRIDGE_FILE", "")      # empty = auto-detect
     g["NT_WINDOW_SECONDS"] = _fint("NT_WINDOW_SECONDS", 900)  # rolling tick window
+    # How much of ticks.csv to re-read on startup (in MB). Bigger = deeper
+    # candle/MTF history immediately after a restart. The file can be huge
+    # after days of NT running; 64 MB ≈ several hours of events.
+    g["NT_CATCHUP_MB"] = _fint("NT_CATCHUP_MB", 64)
     g["NT_WAIT_SECONDS"] = _fint("NT_WAIT_SECONDS", 5)        # first-data wait
 
     # ---- Databento ----------------------------------------------------------

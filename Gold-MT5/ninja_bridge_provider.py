@@ -42,7 +42,11 @@ from data_providers import BaseProvider
 
 logger = logging.getLogger(__name__)
 
-_CATCHUP_BYTES = 10 * 1024 * 1024      # re-read at most the last 10 MB on start
+# How much of the bridge file to re-read on start. The tailer only sees the
+# last NT_CATCHUP_MB megabytes — if ticks.csv has grown huge (days of NT
+# running), a small value leaves the robot with only minutes of history and
+# the candle-based features (ATR, MTF, order blocks, HTF POC) stay idle.
+_CATCHUP_BYTES = max(1, int(getattr(config, "NT_CATCHUP_MB", 64))) * 1024 * 1024
 _PRUNE_INTERVAL = 2.0                  # seconds between tick-window prunes
 _MAX_BOOK_LEVELS = 20                  # snapshot keeps at most this many per side
 
