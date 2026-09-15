@@ -48,7 +48,29 @@ import sys
 import time
 from datetime import datetime
 
-DEFAULT_FILE = os.environ.get("NT_BRIDGE_FILE", r"C:\NinjaBridge\ticks.csv")
+DEFAULT_FILE = r"C:\NinjaBridge\ticks.csv"
+
+
+def resolve_bridge_file(cli_path):
+    """Pick which ticks.csv to use. An explicit --file always wins.
+    Otherwise the first existing file is auto-detected, in this order:
+      1) the NT_BRIDGE_FILE environment variable (if set)
+      2) ticks.csv sitting in the same folder as this script
+      3) A:\\gitHub\\Rhitmic\\ticks.csv
+      4) the default C:\\NinjaBridge\\ticks.csv"""
+    if cli_path:
+        return cli_path, False
+    candidates = []
+    env_path = os.environ.get("NT_BRIDGE_FILE")
+    if env_path:
+        candidates.append(env_path)
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ticks.csv"))
+    candidates.append(r"A:\gitHub\Rhitmic\ticks.csv")
+    candidates.append(DEFAULT_FILE)
+    for cand in candidates:
+        if os.path.exists(cand):
+            return cand, True
+    return env_path or DEFAULT_FILE, False
 
 # Gold market clock (Budapest time, your local time):
 #   Daily halt : 23:00 - 00:00  (CME Globex maintenance)
@@ -58,47 +80,29 @@ DEFAULT_FILE = os.environ.get("NT_BRIDGE_FILE", r"C:\NinjaBridge\ticks.csv")
 
 # ── Depth book ───────────────────────────────────────────────────────────────
 class DepthBook:
-    """Maintains the DOM ladder from level updates (position -> (price, size)).
+    """Order book keyed by PRICE (robust model for Rithmic/NinjaTrader depth).
 
-    NinjaTrader depth operations:
-      Add    = a new level is INSERTED at this position (deeper levels shift down)
-      Update = the level at this position changes price/size
-      Remove = the level at this position is deleted (deeper levels shift up)
+    Add / Update  -> that price now shows this size
+    Remove        -> that price level is gone
+    Positions reported by the feed are just display slots that can shuffle,
+    so they are deliberately ignored here.
     """
 
     def __init__(self):
-        self.bids = {}   # position -> (price, size)
+        self.bids = {}   # price -> size
         self.asks = {}
 
-    def apply(self, side: str, level: int, price: float, size: int, operation: str):
+    def apply(self, side: str, price: float, size: int, operation: str):
         book = self.bids if side == "Bid" else self.asks
-        if operation == "Add":
-            # shift deeper levels down one slot, then insert at the position
-            pos = max(book.keys(), default=-1)
-            while pos >= level:
-                book[pos + 1] = book.pop(pos)
-                pos -= 1
-            book[level] = (price, size)
-        elif operation == "Remove":
-            # delete the position, shift deeper levels up one slot
-            book.pop(level, None)
-            pos = level + 1
-            while pos in book:
-                book[pos - 1] = book.pop(pos)
-                pos += 1
-        else:  # Update
-            book[level] = (price, size)
+        if operation == "Remove" or size <= 0:
+            book.pop(price, None)
+        else:  # Add / Update: set or refresh this price level
+            book[price] = size
 
     def top(self, n=5):
-        # merge levels quoting the same price (sum their sizes), then sort
-        def merged(book):
-            out = {}
-            for price, size in book.values():
-                if size > 0:
-                    out[price] = out.get(price, 0) + size
-            return out
-        bids = sorted(merged(self.bids).items(), key=lambda x: -x[0])[:n]
-        asks = sorted(merged(self.asks).items(), key=lambda x: x[0])[:n]
+        bids = sorted(((p, s) for p, s in self.bids.items() if s > 0),
+                      key=lambda ps: -ps[0])[:n]   # best (highest) bid first
+        asks = sorted(((p, s) for p, s in self.asks.items() if s > 0))[:n]  # best (lowest) ask first
         return bids, asks
 
 
@@ -137,12 +141,24 @@ def wait_for_file(path: str):
     print("File found - starting.\n")
 
 
+def file_identity(path: str):
+    """(device, inode) of a file - changes when it is replaced or rotated."""
+    try:
+        st = os.stat(path)
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return (None, None)
+
+
 def follow(path: str, from_start: bool):
     """Yields complete lines from the file as they appear (like tail -f).
     Yields None periodically when there is nothing new, so the main loop
-    can run its housekeeping (book summaries, stats, staleness watchdog)."""
+    can run its housekeeping (book summaries, stats, staleness watchdog).
+    Survives the file being reset, deleted or rotated by the exporter's
+    size cap: it detects the switch and reopens the fresh file."""
     wait_for_file(path)
     f = open(path, "r", encoding="utf-8", errors="replace")
+    ident = file_identity(path)
     if not from_start:
         f.seek(0, os.SEEK_END)  # jump to end: only NEW events
 
@@ -151,19 +167,29 @@ def follow(path: str, from_start: bool):
         line = f.readline()
         if line.endswith("\n"):
             yield line
-        elif line:  # partial line at EOF - rewind and retry later
+            continue
+        if line:  # partial line at EOF - rewind and retry later
             f.seek(pos)
             yield None
             time.sleep(0.1)
-        else:  # nothing new - yield a housekeeping tick
-            time.sleep(0.25)
-            try:
-                if os.path.getsize(path) < f.tell():
-                    print("[BRIDGE] data file was reset - continuing from the top")
-                    f.seek(0)
-            except OSError:
-                pass
-            yield None
+            continue
+
+        # nothing new - watch for the file being reset / rotated / deleted
+        time.sleep(0.25)
+        try:
+            gone = not os.path.exists(path)
+            replaced = (not gone) and (file_identity(path) != ident
+                                       or os.path.getsize(path) < f.tell())
+            if gone or replaced:
+                print("[BRIDGE] data file was reset/rotated - switching to the fresh one")
+                f.close()
+                wait_for_file(path)
+                f = open(path, "r", encoding="utf-8", errors="replace")
+                f.seek(0, os.SEEK_END)
+                ident = file_identity(path)
+        except OSError:
+            pass
+        yield None
 
 
 def parse_line(line: str):
@@ -187,7 +213,7 @@ def parse_line(line: str):
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description="Gold robot - NinjaTrader bridge edition")
-    ap.add_argument("--file", default=DEFAULT_FILE, help="path to ticks.csv from the NT indicator")
+    ap.add_argument("--file", default=None, help="path to ticks.csv from the NT indicator (auto-detected if omitted)")
     ap.add_argument("--from-start", action="store_true", help="process the file from the beginning (replay)")
     ap.add_argument("--only", default="last,bid,ask", help="which L1 events to print: last,bid,ask")
     ap.add_argument("--book-interval", type=float, default=5.0, help="seconds between [BOOK] summaries (0 = off)")
@@ -196,12 +222,12 @@ def main():
     args = ap.parse_args()
 
     show = {s.strip().lower() for s in args.only.split(",") if s.strip()}
-    path = args.file
+    path, auto = resolve_bridge_file(args.file)
 
     print("=" * 74)
     print("GOLD ROBOT - NinjaTrader bridge edition")
     print("=" * 74)
-    print(f"  data file : {path}")
+    print(f"  data file : {path}" + ("   (auto-detected - pass --file to override)" if auto else ""))
     print(f"  mode      : {'replay whole file' if args.from_start else 'live (new events only)'}")
     print(f"  printing  : {', '.join(sorted(show)) or 'nothing'}"
           + (f" | book every {args.book_interval:.0f}s" if args.book_interval else ""))
@@ -212,7 +238,8 @@ def main():
     print()
 
     books = {}          # instrument -> DepthBook
-    state = {"volume": 0, "big_threshold": args.big, "best_bid": None, "best_ask": None}
+    state = {"volume": 0, "big_threshold": args.big, "best_bid": None, "best_ask": None,
+             "errors": 0}
     total = 0
     skipped = 0
     started = time.time()
@@ -236,23 +263,32 @@ def main():
             if evt is not None:
                 total += 1
                 last_event_mono = now
-                ev = evt["event"]
+                try:
+                    ev = evt["event"]
 
-                # --- dispatch by event type ----------------------------------
-                if ev == "Last" and "last" in show:
-                    print(f"[TRADE ] {evt['instrument']} px={evt['price']:,.2f} "
-                          f"qty={evt['size']} @ {evt['time']}")
-                elif ev == "Bid" and "bid" in show:
-                    print(f"[BID   ] {evt['instrument']} {evt['price']:,.2f} x {evt['size']}")
-                elif ev == "Ask" and "ask" in show:
-                    print(f"[ASK   ] {evt['instrument']} {evt['price']:,.2f} x {evt['size']}")
-                elif ev in ("DepthBid", "DepthAsk"):
-                    book = books.setdefault(evt["instrument"], DepthBook())
-                    book.apply(ev[len("Depth"):], evt["level"], evt["price"], evt["size"],
-                               evt["operation"])
+                    # --- dispatch by event type ------------------------------
+                    if ev == "Last" and "last" in show:
+                        print(f"[TRADE ] {evt['instrument']} px={evt['price']:,.2f} "
+                              f"qty={evt['size']} @ {evt['time']}")
+                    elif ev == "Bid" and "bid" in show:
+                        print(f"[BID   ] {evt['instrument']} {evt['price']:,.2f} x {evt['size']}")
+                    elif ev == "Ask" and "ask" in show:
+                        print(f"[ASK   ] {evt['instrument']} {evt['price']:,.2f} x {evt['size']}")
+                    elif ev in ("DepthBid", "DepthAsk"):
+                        book = books.setdefault(evt["instrument"], DepthBook())
+                        book.apply(ev[len("Depth"):], evt["price"], evt["size"],
+                                   evt["operation"])
 
-                # --- your robot logic ------------------------------------------
-                on_event(evt, state)
+                    # --- your robot logic --------------------------------------
+                    on_event(evt, state)
+
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    # One weird event must NEVER kill a running robot.
+                    state["errors"] += 1
+                    if state["errors"] <= 3 or state["errors"] % 100 == 0:
+                        print(f"[WARN  ] ignored bad event #{state['errors']}: {exc!r}")
 
             # --- periodic book summary (also fires when the market goes quiet) ---
             if args.book_interval and now - last_book_at >= args.book_interval and books:
@@ -297,6 +333,8 @@ def main():
           f"({total/max(1e-9,elapsed):,.0f} events/s). Session volume: {state['volume']:,} lots.")
     if skipped:
         print(f"({skipped:,} malformed/header lines were skipped - normal.)")
+    if state["errors"]:
+        print(f"({state['errors']:,} bad events were ignored with a [WARN] - robot kept running.)")
 
 
 if __name__ == "__main__":

@@ -263,6 +263,21 @@ def _refresh() -> None:
     # while the CFD spread exceeds this percentage (news seconds)
     g["PM_ACTION_MAX_SPREAD_PCT"] = _ffloat("PM_ACTION_MAX_SPREAD_PCT", 0.05)
 
+    # ---- v4.3 profit protection ----
+    # profit ratchet: once the open gain reaches this many ATRs (in price
+    # points), the SL never gives back more than PM_PROFIT_GIVEBACK of the
+    # BEST gain seen — winners close as winners
+    g["PM_PROFIT_LOCK_ENABLE"] = _fget("PM_PROFIT_LOCK_ENABLE", "1") == "1"
+    g["PM_PROFIT_LOCK_MIN_ATR"] = _ffloat("PM_PROFIT_LOCK_MIN_ATR", 1.0)
+    g["PM_PROFIT_GIVEBACK"] = _ffloat("PM_PROFIT_GIVEBACK", 0.5)
+    # momentum exit: a PROFITABLE position (>= this R) closes at market
+    # when flow health says "flow against the position" AND the composite
+    # signal turns against it with at least this strength (softer than the
+    # 55 flip exit — protecting profit deserves a faster trigger)
+    g["PM_MOMENTUM_EXIT_ENABLE"] = _fget("PM_MOMENTUM_EXIT_ENABLE", "1") == "1"
+    g["PM_MOMENTUM_MIN_R"] = _ffloat("PM_MOMENTUM_MIN_R", 0.3)
+    g["PM_MOMENTUM_SIGNAL"] = _ffloat("PM_MOMENTUM_SIGNAL", 40.0)
+
     # ---- live news headlines (fed to the AI so it can weigh fundamentals) ----
     # FREE via Google News RSS — no key, no card needed. 0 disables it.
     g["NEWS_ENABLED"] = _fget("NEWS_ENABLED", "1") == "1"
@@ -320,13 +335,12 @@ def _refresh() -> None:
     # Optional EXTRA Gemini keys (different projects/accounts). The bot
     # rotates through them when one hits its daily quota. Same-project keys
     # share one quota, so use keys from DIFFERENT projects/accounts.
-    g["GEMINI_API_KEYS"] = [k for k in (
-        _fget("GEMINI_API_KEY", ""),
-        _fget("GEMINI_API_KEY_2", ""),
-        _fget("GEMINI_API_KEY_3", ""),
-        _fget("GEMINI_API_KEY_4", ""),
-        _fget("GEMINI_API_KEY_5", ""),
-    ) if k]
+    # v4.3.2: any number of slots — GEMINI_API_KEY_2 ... GEMINI_API_KEY_20
+    # are read automatically; empty slots are simply skipped.
+    _gemini_keys = [_fget("GEMINI_API_KEY", "")]
+    for _n in range(2, 21):
+        _gemini_keys.append(_fget("GEMINI_API_KEY_%d" % _n, ""))
+    g["GEMINI_API_KEYS"] = [k for k in _gemini_keys if k]
     g["MT5_LOGIN"] = _fint("MT5_LOGIN", 0)
     g["MT5_PASSWORD"] = _fget("MT5_PASSWORD", "")
     g["MT5_SERVER"] = _fget("MT5_SERVER", "")

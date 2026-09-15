@@ -19,3 +19,4 @@ venv/
 # ===== OS / editor noise =====
 Thumbs.db
 .DS_Store
+ticks*.csv

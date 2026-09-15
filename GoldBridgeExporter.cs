@@ -40,6 +40,7 @@ namespace NinjaTrader.NinjaScript.Indicators
     public class GoldBridgeExporter : Indicator
     {
         private string filePath;
+        private long bytesSinceCheck = 0;
 
         protected override void OnStateChange()
         {
@@ -52,6 +53,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 DrawOnPricePanel = true;
                 OutputFolder = @"C:\NinjaBridge";
                 ExportDepth = true;
+                MaxFileMB = 250;
+                KeepOldFiles = 2;
             }
             else if (State == State.Configure)
             {
@@ -62,6 +65,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     if (!File.Exists(filePath))
                         File.AppendAllText(filePath,
                             "time,event,price,size,level,operation,instrument" + Environment.NewLine);
+                    MaybeRotate();   // also cap a file that is already oversized at startup
                     Print("GoldBridgeExporter: writing to " + filePath);
                 }
                 catch (Exception ex)
@@ -107,10 +111,79 @@ namespace NinjaTrader.NinjaScript.Indicators
                     "{0:yyyy-MM-ddTHH:mm:ss.fff},{1},{2:R},{3},{4},{5},{6}{7}",
                     t, ev, price, size, level, op, instrument, Environment.NewLine);
                 File.AppendAllText(filePath, line);
+
+                // check the size cap about every 25 MB written
+                bytesSinceCheck += line.Length;
+                if (bytesSinceCheck > 25L * 1024 * 1024)
+                {
+                    bytesSinceCheck = 0;
+                    MaybeRotate();
+                }
             }
             catch (Exception ex)
             {
                 Print("GoldBridgeExporter write error: " + ex.Message);
+            }
+        }
+
+        // Keeps ticks.csv from growing forever: at MaxFileMB it archives the
+        // file (ticks_YYYYMMDD_HHMMSS.csv) and starts a fresh one, keeping at
+        // most KeepOldFiles archives. If the Python robot currently holds the
+        // file open (Windows blocks renaming then), it resets the file in
+        // place instead - the cap is always enforced, archives only when possible.
+        private void MaybeRotate()
+        {
+            if (filePath == null || MaxFileMB <= 0)
+                return;
+            try
+            {
+                FileInfo fi = new FileInfo(filePath);
+                if (!fi.Exists || fi.Length < (long)MaxFileMB * 1024L * 1024L)
+                    return;
+
+                string header = "time,event,price,size,level,operation,instrument" + Environment.NewLine;
+                bool archived = false;
+                try
+                {
+                    string bak = Path.Combine(OutputFolder,
+                        "ticks_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv");
+                    File.Move(filePath, bak);
+                    archived = true;
+                }
+                catch
+                {
+                    // file is held open by the Python robot - reset in place instead
+                    try { File.WriteAllText(filePath, ""); }
+                    catch (Exception ex2)
+                    {
+                        Print("GoldBridgeExporter: cannot cap data file: " + ex2.Message);
+                        return;
+                    }
+                }
+
+                File.AppendAllText(filePath, header);   // fresh file with header
+
+                // delete oldest archives beyond KeepOldFiles
+                try
+                {
+                    string[] old = Directory.GetFiles(OutputFolder, "ticks_*.csv");
+                    Array.Sort(old);
+                    int excess = old.Length - KeepOldFiles;
+                    for (int i = 0; i < excess; i++)
+                    {
+                        try { File.Delete(old[i]); }
+                        catch { }
+                    }
+                }
+                catch { }
+
+                Print(archived
+                    ? "GoldBridgeExporter: data file hit the size cap - archived and started fresh"
+                    : "GoldBridgeExporter: data file hit the size cap - reset (stop the Python robot at day's end to keep archives)");
+            }
+            catch (Exception ex)
+            {
+                Print("GoldBridgeExporter rotation check failed: " + ex.Message);
             }
         }
 
@@ -122,6 +195,14 @@ namespace NinjaTrader.NinjaScript.Indicators
         [NinjaScriptProperty]
         [Display(Name = "Export market depth (L2)", GroupName = "Bridge settings", Order = 2)]
         public bool ExportDepth { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max file size (MB)", GroupName = "Bridge settings", Order = 3)]
+        public int MaxFileMB { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Archived files to keep", GroupName = "Bridge settings", Order = 4)]
+        public int KeepOldFiles { get; set; }
         #endregion
     }
 }

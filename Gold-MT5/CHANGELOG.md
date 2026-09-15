@@ -1,5 +1,132 @@
 # Changelog
 
+## 2026-09-15 — v4.3.2: Gemini key slots up to 20
+
+The user added a 6th key — the old code only read GEMINI_API_KEY_2.._5,
+so key #6 was silently ignored. The key list is now built dynamically:
+GEMINI_API_KEY_2 ... GEMINI_API_KEY_20 are all read automatically, empty
+slots are skipped, rotation order stays numeric. Adding a key to .env
+still takes effect without a restart (hot reload each cycle).
+
+
+## 2026-09-15 — v4.3.1 hotfix: the tick window was capped at ~1 minute
+
+Live log evidence: loop iteration 98 (~3 h uptime, 1.6M bridge lines
+seen) still showed "200 ticks, 2 M1 bars" — the candle window never
+grew. Root cause: `_prune_old_ticks` in `ninja_bridge_provider.py` had
+its two branches inverted. When ALL ticks were fresh (the normal case
+with NT_WINDOW_SECONDS=28800), it fell into the market-halt branch and
+truncated the window to the last 200 ticks. Consequences: candle
+history permanently ~2 M1 bars -> ATR 0 every cycle (the real root
+cause behind the 0.5% emergency stop fallback), MTF / order blocks /
+HTF POC idle forever, VWAP/POC computed on ~1 minute of data.
+
+Fixed: stale head is dropped, halt keeps last 200, a full-fresh window
+is kept whole. With NT_WINDOW_SECONDS=28800 the robot now holds up to
+8 h of trades (~480 M1 bars) and the 64 MB catch-up backfills ~1-2 h
+of history instantly on restart. 6 new tests (T35-T40, battery 6).
+
+
+## 2026-09-15 — v4.3 profit protection (from live observation)
+
+Watched live: a +$8 SELL whose SL stayed behind entry, and a TP that
+adapted but couldn't capture the turn. Two rules and one root-cause fix:
+
+- **PROFIT_LOCK (ratchet)**: once the open gain reaches 1xATR, the SL
+  never gives back more than PM_PROFIT_GIVEBACK (50%) of the BEST gain
+  seen. Winners close as winners — the exact "come back and close in
+  profit, not negative" behaviour requested.
+- **MOMENTUM_EXIT**: a profitable position whose momentum visibly rolls
+  over (flow health "against" + composite signal >= 40 against, armed at
+  >= 0.3R best) closes AT MARKET immediately — no waiting for the TP to
+  be touched, no giving profit back to the trailing stop.
+- **ATR ladder (step 2)**: on a fresh/shallow bridge file the M1 ATR is
+  now estimated from the mean M1 range or the tick range instead of
+  collapsing to 0 — entry stops, buffers and every distance-based rule
+  keep their true scale right after an NT restart (this was the hidden
+  reason the observed stop was so slow to move).
+- 12 new tests (82 total for the manager, all passing).
+
+
+## 2026-09-15 — v4.2 risk perimeter
+
+Protection against the three things no stop-loss can save you from:
+
+- **NEWS_PROTECT / NEWS_FLATTEN**: a HIGH-impact event (CPI/NFP/FOMC)
+  within PM_NEWS_PROTECT_MINUTES (10) now protects open positions —
+  default mode "tighten" locks the gains of profitable trades (losers
+  keep their structural stop: tightening into pre-news noise feeds the
+  hunt); "flatten" mode closes everything before the release.
+- **SESSION_FLATTEN**: at PM_DAILY_FLATTEN_UTC (21:30) every bot position
+  closes BEFORE the XAUUSD CFD daily break — a gap can jump straight over
+  a stop, so the only real protection is being flat. Covers Friday too.
+- **Spread guard**: SL/TP edits and non-urgent closes are postponed while
+  the CFD spread exceeds PM_ACTION_MAX_SPREAD_PCT (0.05%) — never donate
+  a news-second spread. Urgent closes (flattens) still execute.
+- **Flow memory**: the CVD/price history persists in pm_state.json, so
+  flow-health classification no longer needs a warm-up after restarts.
+- 18 new sandbox tests (70 total for the manager, all passing).
+
+## 2026-09-15 — v4.1.1 startup-history fix (from live log review)
+
+First live run of v4.1 revealed the candle-based features were starving:
+the NT bridge tailer only re-read the **last 10 MB** of ticks.csv on start,
+which on a busy news day (CPI burst) covered just minutes — so ATR was 0,
+MTF / order blocks / H1-H4 POC stayed idle and the position manager had to
+use its 0.5% ATR fallback (which is why a far SL was not tightened).
+
+- `NT_CATCHUP_MB` (default 64, in `.env`): how many MB of ticks.csv to
+  re-read at startup — several hours of history, so ATR/MTF/order blocks/
+  HTF POC work immediately after a restart.
+- Step 2 now prints a visible note `candle history shallow (N M1 bars)`
+  while the history is too short, so it is obvious when it has healed.
+
+## 2026-09-15 — v4.1 in-trade intelligence
+
+The five tools now work DURING the trade, not just at entry:
+
+- **HTF POC**: Step 2 attaches `htf_poc` (H1 + H4 volume-profile Points of
+  Control, from the trailing 60/240 M1 bars). The big-timeframe magnets
+  join the SL anchor and TP target pools.
+- **Footprint zones**: stacked-imbalance clusters (one side dominating
+  3:1+ over ≥3 consecutive prices with real volume) are extracted live
+  from the footprint's per-price volumes and act as fresh demand/supply.
+- **Flow health (CVD)**: the manager keeps a rolling CVD/price history and
+  classifies the move each cycle. When price moves in the trade's favour
+  but CVD disagrees ("aggressors exhausted"), the break-even trigger drops
+  from 1.0R to 0.5R. The classification and its next-step guess is logged.
+- **VWAP regime**: trend side (z ≥ 0.5) → SL trails behind VWAP; stretched
+  (z ≥ 2.0) → lock half the open gain; range day → VWAP becomes a TP magnet.
+- All new behaviour is tighten/protect/exit only — never a new trade, never
+  a wider stop. Every level now carries its source ("order block",
+  "footprint imbalance", "H4 POC", ...) into the logs.
+- 16 new sandbox tests (52 total for the manager, all passing) incl. a
+  synthetic 8h session verifying H1/H4 POC against a planted volume node.
+
+## 2026-09-15 — v4 trade management ("no more open-and-forget")
+
+**New: `position_manager.py`** — the robot now manages open positions.
+
+- **Structural SL/TP at entry** (replaces blind 1.5×/3.0×ATR): SL placed
+  beyond order-block zones / POC / strong round numbers with a buffer and
+  hunt-protection (never parked just above x00/x50); TP placed in front of
+  opposing structure so we exit where the big traders bank profit.
+  Distances clamped to [1.2, 3.0]×ATR — fixes stops being too far.
+- **Open-position management every cycle**: adopts existing positions
+  (magic 234000 only; manual trades untouched), tightens far stops
+  (ADOPT_TIGHTEN), moves to break-even at +1R, trails behind fresh
+  structure (tighten-only), updates TP to front-run new opposing levels,
+  and closes early on signal flip (flow-confirmed), CVD divergence, or a
+  dead-trade time stop.
+- **Safety**: SL can never widen; one edit per position per 180s
+  (exits exempt); broker stop-level respected; errors contained.
+- **Audit trail**: every management action + reason journaled to
+  `data/management_log.csv`; per-position state persists across restarts
+  (`data/pm_state.json`).
+- All settings tunable via `PM_*` keys in `.env` (see
+  `docs/POSITION_MANAGER.md`). Verified with 36 sandbox tests incl. SELL
+  mirror, futures→CFD scaling and full pipeline pass.
+
 ## 2026-09-15 — v3 "gold-native" analysis engine
 - Macro votes are now **change-based** (Δ 10Y yields / Δ DXY over 5 sessions,
   VIX vs its 20-session median) + the **macro-opposition rule**: opposition

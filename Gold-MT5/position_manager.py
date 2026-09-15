@@ -95,6 +95,25 @@ D) v4.2 THE RISK PERIMETER (what no stop-loss can protect you from)
                    so flow health no longer needs a warm-up after a
                    restart.
 
+E) v4.3 PROFIT PROTECTION (from live observation 2026-09-15)
+   PROFIT_LOCK    a profit ratchet: once the open gain reaches
+                   PM_PROFIT_LOCK_MIN_ATR x ATR, the SL never gives back
+                   more than PM_PROFIT_GIVEBACK (50%) of the BEST gain
+                   seen. A winner can pull back half way to the lock, but
+                   no further — the trade closes in profit, not at entry.
+   MOMENTUM_EXIT  when a PROFITABLE position's momentum visibly rolls
+                   over — flow health says "flow against the position"
+                   AND the composite signal turns against it (>=
+                   PM_MOMENTUM_SIGNAL, softer than the 55 flip exit) —
+                   the position closes AT MARKET immediately. No waiting
+                   for the TP to be touched and no giving profit back to
+                   a trailing stop.
+   ATR LADDER     (step 2) on a fresh/shallow bridge file the M1 ATR is
+                   now estimated from the mean M1 range or the tick
+                   range instead of collapsing to 0 — so entry stops,
+                   buffers and every distance-based rule keep their TRUE
+                   scale right after an NT restart.
+
 Every action (and the reason for it) is journaled to
 data/management_log.csv so you can audit exactly why the robot did what
 it did — same philosophy as decisions_log.csv.
@@ -888,6 +907,15 @@ class PositionManager:
         initial_r = abs(entry - initial_sl) or (config.PM_MIN_SL_ATR * atr)
         r_now = ((mid - entry) if is_buy else (entry - mid)) / initial_r
 
+        # v4.3: track the best gain this position has reached — the input
+        # to the profit ratchet (PROFIT_LOCK)
+        open_gain_pts = (mid - entry) if is_buy else (entry - mid)
+        best_gain = float(st.get("high_water_pts", 0.0) or 0.0)
+        if open_gain_pts > best_gain:
+            best_gain = open_gain_pts
+            st["high_water_pts"] = best_gain
+            self._save_state()
+
         ctx = {"side": side, "price": price, "profit": profit,
                "r_now": r_now, "cur_sl": cur_sl, "cur_tp": cur_tp,
                "tick": tick, "info": info}
@@ -948,6 +976,26 @@ class PositionManager:
                         f"of the way to TP", ctx)
             return
 
+        # 3b) v4.3 MOMENTUM_EXIT — a PROFITABLE position whose momentum is
+        # visibly rolling over closes AT MARKET: flow health confirms the
+        # move has turned against us AND the composite signal agrees
+        # (softer than the 55 flip exit — this protects profit, and profit
+        # deserves a faster trigger than loss-cutting). Armed once the
+        # trade has EARNED >= PM_MOMENTUM_MIN_R at its best; fires only
+        # while still in profit (losers belong to the stop, not this rule)
+        if (getattr(config, "PM_MOMENTUM_EXIT_ENABLE", True)
+                and open_gain_pts > 0
+                and (best_gain / initial_r) >= config.PM_MOMENTUM_MIN_R
+                and flow_label == "flow against the position"
+                and direction == ("SELL" if is_buy else "BUY")
+                and strength >= config.PM_MOMENTUM_SIGNAL):
+            self._close(position, "MOMENTUM_EXIT",
+                        f"momentum rolled over: flow against the position "
+                        f"+ signal {direction} {strength:.0f} — taking the "
+                        f"profit at market instead of waiting for the TP",
+                        ctx)
+            return
+
         # ================= RULES: SL/TP UPDATES ================= #
         if now - float(st.get("last_modify_ts", 0.0)) < \
                 config.PM_MODIFY_COOLDOWN_SECONDS:
@@ -1006,6 +1054,17 @@ class PositionManager:
                 logger.info("PM: HIGH-impact event '%s' in %.0f min — "
                             "position not in profit; structural SL stays "
                             "the protection", threat_title, threat_mins)
+        # v4.3: profit ratchet — never give back more than PM_PROFIT_GIVEBACK
+        # of the best gain once the trade has earned >= 1 x ATR
+        if getattr(config, "PM_PROFIT_LOCK_ENABLE", True) and best_gain > 0:
+            if best_gain >= config.PM_PROFIT_LOCK_MIN_ATR * atr:
+                lock = entry + sign * best_gain * \
+                    (1.0 - config.PM_PROFIT_GIVEBACK)
+                if lock * sign > cur_sl * sign + min_step:
+                    cands.append((lock, "PROFIT_LOCK",
+                                  f"profit ratchet: best gain {best_gain:.1f} "
+                                  f"pts — never give back more than "
+                                  f"{config.PM_PROFIT_GIVEBACK*100:.0f}%"))
         if cands:
             sl_candidate, rule, reason = max(cands, key=lambda c: c[0] * sign)
         else:

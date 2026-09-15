@@ -2108,6 +2108,17 @@ def analyze_market(market_data: Dict[str, Any],
 
     if len(close) >= 2:
         atr = ta.compute_atr(high, low, close)
+        # ATR fallback ladder: compute_atr needs 15 candles; on a fresh
+        # NT bridge file there may be only a handful. A dead ATR (0.0)
+        # silently inflates every stop distance downstream (the manager
+        # would fall back to 0.5% of price ~ 21 pts — far too wide for
+        # gold intraday). Use the best available estimate instead:
+        #   1. mean M1 range (same scale as a true M1 ATR)
+        #   2. traded tick range * 0.25 (very rough, minutes of data)
+        if atr <= 0:
+            atr = float(np.mean(np.asarray(high, dtype=float) -
+                                np.asarray(low, dtype=float)))
+            notes.append(f"ATR estimated from M1 range ({atr:.2f})")
         bb_u, bb_m, bb_l = ta.compute_bollinger_bands(close)
         atr_pct = (atr / close[-1] * 100.0) if close[-1] else 0.0
         rng = float(np.ptp(close[-52:])) if len(close) >= 2 else 0.0
@@ -2130,6 +2141,16 @@ def analyze_market(market_data: Dict[str, Any],
             timestamp=now)
     else:
         notes.append("insufficient candle data -> technicals defaulted")
+
+    # ATR ladder step 2: no candles at all, but ticks exist -> rough range
+    if volatility.atr <= 0 and tick_data:
+        prices = [float(t.get("price", 0.0) or 0.0) for t in tick_data[-400:]]
+        prices = [p for p in prices if p > 0]
+        if len(prices) >= 20:
+            rough = (max(prices) - min(prices)) * 0.25
+            if rough > 0:
+                volatility.atr = float(rough)
+                notes.append(f"ATR estimated from tick range ({rough:.2f})")
 
     # visibility: a shallow candle history silently disables ATR, MTF,
     # order blocks and HTF POC — say so, so it is obvious when it heals

@@ -206,23 +206,32 @@ class _BridgeTail:
 
     # ------------------------------------------------------------------ #
     def _prune_old_ticks(self, window: float) -> None:
-        """Keep only trades newer than `window` seconds (by event time)."""
+        """Keep only trades newer than `window` seconds (by event time).
+
+        v4.3.1: the old logic was inverted. When the FIRST tick was still
+        fresh (the normal case once NT_WINDOW_SECONDS is large), the code
+        fell into the market-halt branch and truncated the window to the
+        last 200 ticks (~1 minute) — so candle history never grew past
+        ~2 M1 bars and ATR / MTF / order blocks / HTF POC stayed idle
+        forever, no matter how long the robot ran. Correct behaviour:
+          - drop the stale head (ticks older than the window)
+          - when even the NEWEST tick is stale (market halt), keep the
+            last 200 so book/flow don't go completely blind
+        """
         cutoff = time.time() - window
         for st in self.instruments.values():
-            if st.ticks:
-                keep_from = 0
-                for i, t in enumerate(st.ticks):
-                    if t["ts"].timestamp() >= cutoff:
-                        keep_from = i
-                        break
-                else:
-                    keep_from = len(st.ticks)
-                if keep_from:
-                    del st.ticks[:keep_from]
-                else:
-                    # newest event is still old (market halt) - keep last 200
-                    if len(st.ticks) > 200:
-                        del st.ticks[:-200]
+            if not st.ticks:
+                continue
+            first_fresh = None
+            for i, t in enumerate(st.ticks):
+                if t["ts"].timestamp() >= cutoff:
+                    first_fresh = i
+                    break
+            if first_fresh is not None:
+                if first_fresh:                 # 0 == all already fresh
+                    del st.ticks[:first_fresh]
+            elif len(st.ticks) > 200:           # halt: newest is stale
+                del st.ticks[:-200]
 
     # ------------------------------------------------------------------ #
     def _catch_up(self, f) -> None:
