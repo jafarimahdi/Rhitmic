@@ -448,6 +448,12 @@ def _refresh() -> None:
     # after days of NT running; 64 MB ≈ several hours of events.
     g["NT_CATCHUP_MB"] = _fint("NT_CATCHUP_MB", 64)
     g["NT_WAIT_SECONDS"] = _fint("NT_WAIT_SECONDS", 5)        # first-data wait
+    # v4.4.3: rotate ticks.csv at this size (BEFORE the exporter's 250 MB
+    # cap, which wipes the file while the robot holds it open). 0 = off.
+    g["NT_ROTATE_MB"] = _ffloat("NT_ROTATE_MB", 200.0)
+    # v4.4.3: delete gzipped tick archives older than this many days
+    # (0 = keep forever — archives are the backtest record).
+    g["NT_ARCHIVE_KEEP_DAYS"] = _ffloat("NT_ARCHIVE_KEEP_DAYS", 0.0)
 
     # ---- Databento ----------------------------------------------------------
     g["DATABENTO_DATASET"] = _fget("DATABENTO_DATASET", "GLBX.MDP3")

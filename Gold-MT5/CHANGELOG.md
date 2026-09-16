@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-09-16 — v4.4.3: tick file lifecycle (safe rotation + compressed archives)
+
+**Problem:** ticks.csv grows ~35-40 MB/hour. The NinjaTrader exporter caps it
+at 250 MB, but while the robot is running it holds the file open — Windows
+then blocks the exporter's rename-to-archive, and the exporter's fallback
+WIPES the file instead. Result: every ~6-7 hours of recording, hours of data
+silently vanished (a full-day backtest would only ever see the last chunk).
+
+**Fix — the robot now manages the file itself:**
+- At NT_ROTATE_MB (default 200 MB) the bridge tailer rotates ticks.csv: it
+  renames the file itself (it is the one holding it open), starts a fresh
+  ticks.csv with the same header, and keeps EVERY in-memory tick/book state —
+  the 8-hour analysis window survives the rotation untouched.
+- The rotated chunk is gzipped into data/archive/ (~8-10x smaller) by a
+  background thread, verified with a full CRC pass, then the raw chunk is
+  deleted. Chunks created by NinjaTrader itself (possible only while the
+  robot is closed) are archived the same way at the next robot start.
+- tools/backtest.py accepts .csv.gz archives directly.
+- Daily maintenance prunes data/archive/ when NT_ARCHIVE_KEEP_DAYS > 0
+  (default 0 = keep forever; archives are the backtest record).
+
+**Verified:** full lifecycle simulation with continuous writes — rotation at
+threshold, gzip roundtrip, in-memory window continuity across the rotation,
+fresh-file growth, tailer health; backtest parity on .csv vs .csv.gz.
+Live disk footprint is now bounded (~200-250 MB live + ~100-150 MB of
+archives per trading day); RAM stays flat.
+
 ## 2026-09-16 — v4.4.2: news perimeter revived (stale-calendar bug)
 
 **Bug:** `NEWS STATE` was stuck on `QUIET — next event in 0 min (none)` all

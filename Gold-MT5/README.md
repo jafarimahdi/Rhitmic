@@ -19,6 +19,10 @@ STEP 2  SignalEngine (25+ signals: L2 imbalance, microprice, CVD, VWAP...)
 STEP 3  Gemini AI  →  BUY / SELL / HOLD + confidence
         ▼
 STEP 4  MT5 execution  →  XAUUSD on your MT5 account
+          (structural SL/TP: order blocks / POC / round numbers)
+        ▼
+STEP 4a Position manager  →  break-even, trailing, early exits
+          while a position is open (docs/POSITION_MANAGER.md)
         ▼
 STEP 5  Monitoring loop (repeat every 60 s)
 ```
@@ -88,6 +92,26 @@ A:\gitHub\Rhitmic\Gold-MT5\            ← the ONE folder (name your choice)
 - The MT5 terminal itself (`C:\Program Files\...`) — only referenced if you let the bot launch MT5
 
 Everything else — data, logs, decisions, robot, config — is inside the one folder.
+
+### Where your tick data lives (v4.4.3)
+
+`ticks.csv` grows ~35–40 MB per trading hour. The robot manages it for you:
+
+- At **200 MB** (`NT_ROTATE_MB`) the robot rotates the file itself: the old data
+  becomes a chunk, a fresh `ticks.csv` starts, and the analysis window in memory
+  is untouched. This happens *before* NinjaTrader's own 250 MB cap — that cap,
+  while the robot is running, would otherwise **wipe** the file (Windows blocks
+  NinjaTrader from renaming a file the robot has open).
+- The chunk is compressed automatically into **`data\archive\`** (about 8–10×
+  smaller, verified before the raw copy is deleted). Roughly **100–150 MB of
+  .gz archives per trading day** — your permanent backtest record.
+- Backtest accepts archives directly:
+  `python tools/backtest.py --file data/archive/ticks_20260916_170000.csv.gz`
+- `NT_ARCHIVE_KEEP_DAYS=0` keeps archives forever; set e.g. `30` to auto-delete
+  older ones (daily maintenance).
+
+Net effect on your PC: the live folder stays around **200–250 MB**, memory use
+stays flat (~30 MB for the 8-hour window), and nothing grows without bound.
 
 ## One-time setup on your PC
 

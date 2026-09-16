@@ -502,7 +502,13 @@ class Backtester:
     # ---------------- main replay loop -------------------------------------- #
     def run(self) -> dict:
         args = self.args
-        with open(args.file, "r", encoding="utf-8", errors="replace") as fh:
+        # v4.4.3: archives are gzipped — accept both ticks.csv and .csv.gz
+        if str(args.file).lower().endswith(".gz"):
+            import gzip
+            fh = gzip.open(args.file, "rt", encoding="utf-8", errors="replace")
+        else:
+            fh = open(args.file, "r", encoding="utf-8", errors="replace")
+        with fh:
             next_cycle_ts: Optional[float] = None
             chosen: Optional[str] = args.symbol or None
             st = None

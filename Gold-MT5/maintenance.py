@@ -146,9 +146,30 @@ def run_maintenance(force: bool = False) -> None:
         rotate_logs()
         trim_csvs()
         clean_recordings()
+        _clean_tick_archives()
         _set_last_run(today)
     except Exception as exc:
         logger.warning("Maintenance failed (non-fatal): %s", exc)
+
+
+def _clean_tick_archives() -> None:
+    """v4.4.3: delete gzipped tick archives (data/archive/ticks_*.csv.gz)
+    older than NT_ARCHIVE_KEEP_DAYS days. Default 0 = keep forever — they
+    are the backtest record. Set e.g. 30 to keep one month of raw data."""
+    keep_days = float(getattr(config, "NT_ARCHIVE_KEEP_DAYS", 0) or 0)
+    if keep_days <= 0:
+        return
+    archive_dir = Path(config.DATA_DIR) / "archive"
+    if not archive_dir.exists():
+        return
+    cutoff = time.time() - keep_days * 86400.0
+    for gz in archive_dir.glob("ticks_*.csv.gz"):
+        try:
+            if gz.stat().st_mtime < cutoff:
+                gz.unlink()
+                logger.info("maintenance: deleted old tick archive %s", gz.name)
+        except OSError:
+            continue
 
 
 def report_sizes() -> Dict[str, int]:

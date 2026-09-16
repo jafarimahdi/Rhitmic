@@ -30,11 +30,15 @@ Notes:
 from __future__ import annotations
 
 import csv
+import gzip
 import logging
 import os
+import re
+import shutil
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import config
@@ -49,6 +53,16 @@ logger = logging.getLogger(__name__)
 _CATCHUP_BYTES = max(1, int(getattr(config, "NT_CATCHUP_MB", 64))) * 1024 * 1024
 _PRUNE_INTERVAL = 2.0                  # seconds between tick-window prunes
 _MAX_BOOK_LEVELS = 20                  # snapshot keeps at most this many per side
+
+# v4.4.3: rotation + archival. The exporter caps ticks.csv at 250 MB, but
+# while the robot runs it holds the file open — Windows then blocks the
+# exporter's rename, and its fallback WIPES the file. So we rotate first
+# (default 200 MB): we rename it ourselves, start a fresh file, keep every
+# in-memory tick/book state, and gzip the chunk into data/archive/.
+_CSV_HEADER = "time,event,price,size,level,operation,instrument\n"
+_CHUNK_RE = re.compile(r"^ticks_\d{8}_\d{6}\.csv$")
+_ARCHIVE_LOCK = threading.Lock()
+_ARCHIVE_STATE = {"running": False}     # one background gzip worker at a time
 
 
 def _parse_ts(raw: str) -> Optional[datetime]:
@@ -205,10 +219,114 @@ class _BridgeTail:
         # unknown event types are ignored silently
 
     # ------------------------------------------------------------------ #
+    def _maybe_rotate(self, f) -> Any:
+        """v4.4.3: rotate ticks.csv BEFORE NinjaTrader's 250 MB cap.
+
+        While the robot runs it holds ticks.csv open, so the exporter's own
+        rotation cannot rename the file and falls back to WIPING it —
+        silently destroying hours of recorded data. Rotating earlier from
+        our side is safe: we close our handle, rename (retrying while the
+        exporter's per-line micro-handles come and go), start a fresh
+        file, and keep every in-memory tick/book state, so the analysis
+        window survives the rotation untouched. The renamed chunk is then
+        gzipped into data/archive/ by a background thread.
+        Returns the (possibly new) file handle; the caller must refresh
+        its file-identity after a rotation.
+        """
+        threshold = float(getattr(config, "NT_ROTATE_MB", 200.0) or 0) * 1048576.0
+        if threshold <= 0:
+            return f
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            return f
+        if size < threshold:
+            return f
+
+        try:
+            f.close()
+        except OSError:
+            pass
+        chunk = None
+        for _ in range(20):            # exporter holds short handles per line
+            candidate = os.path.join(
+                os.path.dirname(self.path) or ".",
+                "ticks_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv")
+            try:
+                os.rename(self.path, candidate)
+                chunk = candidate
+                break
+            except OSError:
+                time.sleep(0.05)
+        if chunk is None:
+            logger.warning("NT bridge: ticks.csv rotation deferred (rename "
+                           "blocked); retrying on the next prune tick")
+            return open(self.path, "r", encoding="utf-8", errors="replace")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(_CSV_HEADER)      # fresh file, same schema
+        logger.info("NT bridge: rotated ticks.csv at %.0f MB -> %s",
+                    size / 1048576.0, os.path.basename(chunk))
+        self._archive_pending_async()
+        return open(self.path, "r", encoding="utf-8", errors="replace")
+
+    # ------------------------------------------------------------------ #
+    def _archive_pending_async(self) -> None:
+        """Gzip every rotated chunk (ticks_*.csv) into data/archive/ and
+        delete the raw copies. One background worker; safe to call often.
+        Chunks come from our own rotations and from NinjaTrader's (which
+        can only archive while the robot is closed)."""
+        with _ARCHIVE_LOCK:
+            if _ARCHIVE_STATE["running"]:
+                return
+            _ARCHIVE_STATE["running"] = True
+
+        def _worker() -> None:
+            try:
+                folder = os.path.dirname(self.path) or "."
+                while not self._stop.is_set():
+                    try:
+                        names = sorted(n for n in os.listdir(folder)
+                                       if _CHUNK_RE.match(n))
+                    except OSError:
+                        return
+                    if not names:
+                        return
+                    outdir = Path(__file__).resolve().parent / "data" / "archive"
+                    outdir.mkdir(parents=True, exist_ok=True)
+                    for name in names:
+                        src = os.path.join(folder, name)
+                        dst = outdir / (name + ".gz")
+                        try:
+                            if dst.exists():          # archived on an earlier run
+                                os.remove(src)
+                                continue
+                            tmp = outdir / (name + ".gz.part")
+                            with open(src, "rb") as fin, \
+                                    gzip.open(tmp, "wb", 6) as fout:
+                                shutil.copyfileobj(fin, fout, 1 << 20)
+                            with gzip.open(tmp, "rb") as v:   # verify: full CRC
+                                while v.read(1 << 20):
+                                    pass
+                            os.replace(tmp, dst)
+                            raw_mb = os.path.getsize(src) / 1048576.0
+                            os.remove(src)
+                            logger.info("NT bridge: archived %s "
+                                        "(%.0f MB -> %.1f MB gz)", name, raw_mb,
+                                        dst.stat().st_size / 1048576.0)
+                        except OSError as exc:
+                            logger.warning("NT bridge: archiving %s failed "
+                                           "(%s); will retry later", name, exc)
+                            return
+            finally:
+                with _ARCHIVE_LOCK:
+                    _ARCHIVE_STATE["running"] = False
+
+        threading.Thread(target=_worker, name="nt-bridge-archive",
+                         daemon=True).start()
+
+    # ------------------------------------------------------------------ #
     def _prune_old_ticks(self, window: float) -> None:
         """Keep only trades newer than `window` seconds (by event time).
-
-        v4.3.1: the old logic was inverted. When the FIRST tick was still
         fresh (the normal case once NT_WINDOW_SECONDS is large), the code
         fell into the market-halt branch and truncated the window to the
         last 200 ticks (~1 minute) — so candle history never grew past
@@ -261,6 +379,7 @@ class _BridgeTail:
         ident = _file_identity(self.path)
         with self.lock:
             self._catch_up(f)
+        self._archive_pending_async()   # v4.4.3: gzip leftover rotated chunks
         last_prune = time.time()
 
         while not self._stop.is_set():
@@ -274,6 +393,10 @@ class _BridgeTail:
                         last_prune = now
                         self._prune_old_ticks(
                             max(60, int(getattr(config, "NT_WINDOW_SECONDS", 900))))
+                        nf = self._maybe_rotate(f)     # v4.4.3: rotate early
+                        if nf is not f:
+                            f = nf
+                            ident = _file_identity(self.path)
                 continue
 
             if line:                            # partial line - rewind
