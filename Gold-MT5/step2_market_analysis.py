@@ -45,6 +45,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+import config   # v4.4: signal weights/thresholds are .env-tunable
+
 try:
     import requests
 except ImportError:  # pragma: no cover
@@ -231,6 +233,7 @@ class MarketSnapshot:
     confidence: float = 0.0           # 0-100
     regime: str = "NEUTRAL"           # "TREND" | "RANGE" | "NEUTRAL"
     divergence: float = 0.0           # +1 bullish / -1 bearish CVD divergence
+    macro_bias: float = 0.0           # -1..+1 macro backdrop (+ = bullish gold)
     mtf_trends: Dict[str, str] = field(default_factory=dict)  # {"H1":"UP","M15":"DOWN","M5":"UP"}
     # v4.1: higher-timeframe Points of Control — the 1h and 4h volume magnets
     # the big timeframe players trade around ("POC in the bigger candles")
@@ -1521,8 +1524,13 @@ class EconomicCalendar:
 class SignalEngine:
     """Aggregates all metric groups into a single trading signal."""
 
-    BUY_THRESHOLD = 15.0
-    SELL_THRESHOLD = -15.0
+    BUY_THRESHOLD = 15.0    # fallback only — real value comes from
+    SELL_THRESHOLD = -15.0  # .env SIGNAL_BUY/SELL_THRESHOLD (v4.4)
+
+    def _thresholds(self):
+        """Entry thresholds, tunable from .env without touching code."""
+        return (float(getattr(config, "SIGNAL_BUY_THRESHOLD", self.BUY_THRESHOLD)),
+                float(getattr(config, "SIGNAL_SELL_THRESHOLD", self.SELL_THRESHOLD)))
 
     def aggregate(self, price: float, volatility: VolatilityMetrics,
                   trend: TrendMetrics, order_flow: OrderFlowMetrics,
@@ -1552,7 +1560,9 @@ class SignalEngine:
         # its importance (H1 counts most). Stacked agreement = strong signal;
         # disagreement weakens it — this filters trades that fight the trend.
         mtf_trends = mtf_trends or {}
-        tf_weights = {"H1": 1.0, "M15": 0.8, "M5": 0.6}
+        tf_weights = {"H1": float(getattr(config, "SIGNAL_W_H1", 1.0)),
+                      "M15": float(getattr(config, "SIGNAL_W_M15", 0.8)),
+                      "M5": float(getattr(config, "SIGNAL_W_M5", 0.6))}
         for tf_name in ("H1", "M15", "M5"):
             tf_dir = mtf_trends.get(tf_name)
             if tf_dir == "UP":
@@ -1565,49 +1575,65 @@ class SignalEngine:
 
         # ---- 1) Trend / momentum ---------------------------------------------
         if trend.trend_direction == "UP":
-            votes.append((+1.0, 0.5 + 0.5 * (trend.trend_strength / 100.0)))
+            votes.append((+1.0, float(getattr(config, "SIGNAL_W_TREND", 0.5))
+                         + 0.5 * (trend.trend_strength / 100.0)))
         elif trend.trend_direction == "DOWN":
-            votes.append((-1.0, 0.5 + 0.5 * (trend.trend_strength / 100.0)))
+            votes.append((-1.0, float(getattr(config, "SIGNAL_W_TREND", 0.5))
+                         + 0.5 * (trend.trend_strength / 100.0)))
         else:
             notes.append("trend neutral")
 
-        votes.append((np.clip(trend.macd_histogram * 10.0, -1.0, 1.0), 0.6))
+        votes.append((np.clip(trend.macd_histogram * 10.0, -1.0, 1.0),
+                   float(getattr(config, "SIGNAL_W_MACD", 0.6))))
         if trend.rsi > 55:
-            votes.append((+1.0, 0.5))
+            votes.append((+1.0, float(getattr(config, "SIGNAL_W_EMA_CROSS", 0.5))))
         elif trend.rsi < 45:
-            votes.append((-1.0, 0.5))
-        votes.append((np.sign(price - trend.sma_50) if trend.sma_50 else 0.0, 0.7))
-        votes.append((np.sign(price - trend.sma_20) if trend.sma_20 else 0.0, 0.5))
+            votes.append((-1.0, float(getattr(config, "SIGNAL_W_EMA_CROSS", 0.5))))
+        votes.append((np.sign(price - trend.sma_50) if trend.sma_50 else 0.0,
+                   float(getattr(config, "SIGNAL_W_SMA50", 0.7))))
+        votes.append((np.sign(price - trend.sma_20) if trend.sma_20 else 0.0,
+                   float(getattr(config, "SIGNAL_W_SMA20", 0.5))))
 
         # ---- 2) Order flow (tick) --------------------------------------------
         # volume-RELATIVE aggression (buy%% - sell%%): immune to thin-market
         # distortion (100 contracts means nothing without volume context)
         votes.append((np.clip((order_flow.buying_pressure -
-                               order_flow.selling_pressure) / 100.0, -1.0, 1.0), 0.8))
-        votes.append((np.sign(order_flow.cvd), 0.6))
-        votes.append((np.clip((order_flow.bid_ask_ratio - 1.0) * 2.0, -1.0, 1.0), 0.6))
+                               order_flow.selling_pressure) / 100.0, -1.0, 1.0),
+                   float(getattr(config, "SIGNAL_W_PRESSURE", 0.8))))
+        votes.append((np.sign(order_flow.cvd),
+                   float(getattr(config, "SIGNAL_W_CVD", 0.6))))
+        votes.append((np.clip((order_flow.bid_ask_ratio - 1.0) * 2.0, -1.0, 1.0),
+                   float(getattr(config, "SIGNAL_W_BIDASK", 0.6))))
 
         # ---- 3) LEVEL 2 depth analytics --------------------------------------
         # order-flow imbalance (leading indicator of short-term direction)
         book_size = order_flow.level2_bid_depth + order_flow.level2_ask_depth
-        votes.append((np.tanh(order_flow.ofi / max(book_size, 1.0) * 5.0), 0.9))
-        votes.append((np.clip(order_flow.depth_imbalance * 2.5, -1.0, 1.0), 0.7))
+        votes.append((np.tanh(order_flow.ofi / max(book_size, 1.0) * 5.0),
+                   float(getattr(config, "SIGNAL_W_OFI", 0.9))))
+        votes.append((np.clip(order_flow.depth_imbalance * 2.5, -1.0, 1.0),
+                   float(getattr(config, "SIGNAL_W_DEPTH", 0.7))))
         # microprice: where fair value sits vs last price
         if order_flow.microprice:
             scale = volatility.atr or (price * 0.001)
-            votes.append((np.clip((price - order_flow.microprice) / scale, -1.0, 1.0), 0.5))
+            votes.append((np.clip((price - order_flow.microprice) / scale, -1.0, 1.0),
+                   float(getattr(config, "SIGNAL_W_MICRO", 0.5))))
         # absorption: net ask-absorption (buyers) vs bid-absorption (sellers)
-        votes.append((np.clip(order_flow.absorption_net * 0.5, -1.0, 1.0), 0.5))
+        votes.append((np.clip(order_flow.absorption_net * 0.5, -1.0, 1.0),
+                   float(getattr(config, "SIGNAL_W_ABSORB", 0.5))))
 
         # ---- 4) Footprint ----------------------------------------------------
-        votes.append((footprint.delta_imbalance, 0.7))
+        votes.append((footprint.delta_imbalance,
+                   float(getattr(config, "SIGNAL_W_FOOTPRINT", 0.7))))
 
         # ---- 5) LEVEL 3 order events -----------------------------------------
-        votes.append((np.clip(level3.order_book_imbalance * 2.0, -1.0, 1.0), 0.6))
+        votes.append((np.clip(level3.order_book_imbalance * 2.0, -1.0, 1.0),
+                   float(getattr(config, "SIGNAL_W_L3_IMB", 0.6))))
         aggr_vol = level3.aggressive_buy_volume + level3.aggressive_sell_volume
-        votes.append((np.tanh(level3.ofi / max(aggr_vol, 1.0) * 5.0), 0.8))
+        votes.append((np.tanh(level3.ofi / max(aggr_vol, 1.0) * 5.0),
+                   float(getattr(config, "SIGNAL_W_L3_OFI", 0.8))))
         ar = level3.aggressive_flow_ratio
-        votes.append((np.clip((ar - 0.5) * 4.0, -1.0, 1.0), 0.8))
+        votes.append((np.clip((ar - 0.5) * 4.0, -1.0, 1.0),
+                   float(getattr(config, "SIGNAL_W_L3_AGGR", 0.8))))
         # streaks: momentum in aggressor flow
         if level3.buy_streak >= 3:
             votes.append((+1.0, 0.3))
@@ -1616,15 +1642,16 @@ class SignalEngine:
 
         # ---- 6) CVD-price divergence -----------------------------------------
         if divergence > 0:
-            votes.append((+1.0, 1.2))
+            votes.append((+1.0, float(getattr(config, "SIGNAL_W_DIVERGENCE", 1.2))))
             notes.append("bullish CVD divergence (price down, buying up)")
         elif divergence < 0:
-            votes.append((-1.0, 1.2))
+            votes.append((-1.0, float(getattr(config, "SIGNAL_W_DIVERGENCE", 1.2))))
             notes.append("bearish CVD divergence (price up, selling up)")
 
         # ---- 7) Volume profile (regime-aware) --------------------------------
         if volume_profile.vwap:
-            votes.append((np.sign(price - volume_profile.vwap), 0.6))
+            votes.append((np.sign(price - volume_profile.vwap),
+                   float(getattr(config, "SIGNAL_W_VWAP", 0.6))))
         if volume_profile.poc:
             votes.append((np.sign(price - volume_profile.poc), 0.4))
         # VWAP z-score mean-reversion: only fade extremes in a RANGE regime
@@ -1733,9 +1760,10 @@ class SignalEngine:
         score = sum(s * w for s, w in votes) / total_weight
         score_scaled = float(np.clip(score, -1.0, 1.0) * 100.0)
 
-        if score_scaled >= self.BUY_THRESHOLD:
+        buy_thr, sell_thr = self._thresholds()
+        if score_scaled >= buy_thr:
             direction = "BUY"
-        elif score_scaled <= self.SELL_THRESHOLD:
+        elif score_scaled <= sell_thr:
             direction = "SELL"
         else:
             direction = "NEUTRAL"
@@ -1745,11 +1773,13 @@ class SignalEngine:
         # shrinks the score up to 50%; EXTREME opposition (>0.8) without order-
         # flow confirmation (delta or OFI agreeing with the direction) caps the
         # signal to NEUTRAL.
+        self.last_macro_bias = 0.0   # v4.4: fresh reading for the PM
         if direction in ("BUY", "SELL"):
             dir_sign = 1.0 if direction == "BUY" else -1.0
             m_w = sum(w for _, w in macro_pairs)
             if m_w > 0:
                 macro_bias = sum(s * w for s, w in macro_pairs) / m_w  # -1..+1
+                self.last_macro_bias = float(macro_bias)
                 opposition = max(0.0, -dir_sign * macro_bias)          # 0..1
                 if opposition > 0.05:
                     score_scaled *= (1.0 - 0.5 * opposition)
@@ -1762,9 +1792,9 @@ class SignalEngine:
                             notes.append("extreme macro opposition without flow "
                                          "confirmation -> capped to NEUTRAL")
                             score_scaled = 0.0
-                if score_scaled >= self.BUY_THRESHOLD:
+                if score_scaled >= buy_thr:
                     direction = "BUY"
-                elif score_scaled <= self.SELL_THRESHOLD:
+                elif score_scaled <= sell_thr:
                     direction = "SELL"
                 else:
                     direction = "NEUTRAL"
@@ -2267,7 +2297,8 @@ def analyze_market(market_data: Dict[str, Any],
             " (London breakout)" if asia_range.get("breakout") else ""))
 
     # ---- aggregate signal ----------------------------------------------------
-    strength, direction, confidence, sig_notes = SignalEngine().aggregate(
+    sig_engine = SignalEngine()
+    strength, direction, confidence, sig_notes = sig_engine.aggregate(
         price, volatility, trend, order_flow, footprint, level3, vp, macro,
         news, regime=regime, divergence=divergence, mtf_trends=mtf_trends,
         nearest_support=nearest_support, nearest_resistance=nearest_resistance,
@@ -2275,12 +2306,20 @@ def analyze_market(market_data: Dict[str, Any],
         asia_range=asia_range or None)
     notes.extend(sig_notes)
 
+    # v4.4: expose the macro backdrop (-1..+1) to the position manager
+    # (macro-aware defense). Default 0.0 = no macro read = old behavior.
+    try:
+        macro_bias_now = float(getattr(sig_engine, "last_macro_bias", 0.0))
+    except Exception:
+        macro_bias_now = 0.0
+
     snapshot = MarketSnapshot(
         timestamp=now, price=price, bid=bid, ask=ask, volume=volume,
         order_flow=order_flow, footprint=footprint, level3=level3,
         volatility=volatility, trend=trend, volume_profile=vp, macro=macro,
         news=news, signal_strength=strength, signal_direction=direction,
         confidence=confidence, regime=regime, divergence=divergence,
+        macro_bias=macro_bias_now,
         mtf_trends=mtf_trends, spread_pct=spread_pct,
         order_blocks=order_blocks, nearest_support=nearest_support,
         nearest_resistance=nearest_resistance,

@@ -146,6 +146,7 @@ except ImportError:  # pragma: no cover
     mt5 = None
 
 import config
+import trade_history
 
 logger = logging.getLogger(__name__)
 
@@ -537,8 +538,49 @@ class PositionManager:
                  if t != "_flow" and t not in live_tickets]
         if stale:
             for t in stale:
+                self._record_gone(t, self._state.get(t, {}))
                 self._state.pop(t, None)
             self._save_state()
+
+    def _record_gone(self, ticket: str, st: dict) -> None:
+        """v4.4: a known position disappeared between cycles — almost
+        always its SL or TP fired at the broker. Try MT5's deal history
+        first (exact PnL); fall back to the last observed state. This is
+        what makes LOSS MEMORY complete (a stop-out IS a loss)."""
+        try:
+            side = str(st.get("side", "") or "")
+            vol = float(st.get("last_volume", 0.0) or 0.0)
+            gain = float(st.get("last_gain_pts", 0.0) or 0.0)
+            entry = float(st.get("entry", 0.0) or 0.0)
+            last_sl = float(st.get("last_sl", 0.0) or 0.0)
+            pnl_usd = None
+            reason = "GONE (SL/TP hit or manual close)"
+            try:
+                now_dt = datetime.now(timezone.utc)
+                from_dt = datetime.fromtimestamp(
+                    now_dt.timestamp() - 48 * 3600.0, tz=timezone.utc)
+                deals = self._mt5.history_deals_get(
+                    from_dt, now_dt, position=int(ticket))
+                if deals:
+                    pnl_usd = sum(float(getattr(d, "profit", 0.0) or 0.0)
+                                  for d in deals)
+                    for d in reversed(deals):
+                        c = str(getattr(d, "comment", "") or "")
+                        if c:
+                            reason = f"GONE (broker: {c[:24]})"
+                            break
+            except Exception:
+                pass
+            if pnl_usd is None and entry > 0 and last_sl > 0 and gain < 0:
+                # no history available: if we last saw the position LOSING,
+                # assume the stop fired (loss memory must not miss these)
+                sl_gain = (last_sl - entry) if side == "BUY" else (entry - last_sl)
+                gain = min(gain, sl_gain)
+            trade_history.record_close(ticket, side, 0.0, reason,
+                                       gain_pts=gain, volume=vol,
+                                       estimated=True, pnl_usd=pnl_usd)
+        except Exception:
+            logger.exception("PM: gone-position record failed (non-fatal)")
 
     # ---------------- journal ---------------- #
     @staticmethod
@@ -548,6 +590,10 @@ class PositionManager:
             new_file = not JOURNAL_PATH.exists() or \
                 JOURNAL_PATH.stat().st_size == 0
             row = {k: row.get(k, "") for k in _MGMT_LOG_FIELDS}
+            # v4.4: stamp the row here so no caller can forget it
+            if not row.get("timestamp"):
+                row["timestamp"] = datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%S")
             with open(JOURNAL_PATH, "a", newline="", encoding="utf-8") as fh:
                 writer = csv.DictWriter(fh, fieldnames=_MGMT_LOG_FIELDS)
                 if new_file:
@@ -677,6 +723,85 @@ class PositionManager:
                     ctx.get("cur_tp", 0.0), new_tp, reason)
         return True
 
+    def _partial_close(self, position, fraction: float, rule: str,
+                       reason: str, ctx: dict) -> bool:
+        """v4.4: close a FRACTION of a position at market, keep the rest.
+
+        Returns True when the partial fill happened. Refuses when the
+        position cannot be split cleanly (either half would be below the
+        broker minimum lot) — 0.01-lot positions simply skip this rule.
+        """
+        if not 0.0 < float(fraction or 0.0) < 1.0:
+            return False
+        spread_pct = self._spread_pct(ctx)
+        if spread_pct > config.PM_ACTION_MAX_SPREAD_PCT:
+            logger.info("PM: postponed PARTIAL — spread %.3f%% too wide",
+                        spread_pct)
+            return False
+        tick = ctx.get("tick")
+        info = ctx.get("info")
+        pos_type = getattr(position, "type", None)
+        is_buy = pos_type == getattr(self._mt5, "POSITION_TYPE_BUY", 0)
+        price = (getattr(tick, "bid", 0.0) if is_buy
+                 else getattr(tick, "ask", 0.0))
+        volume = float(getattr(position, "volume", 0.0) or 0.0)
+        ticket = getattr(position, "ticket", None)
+        if not ticket or volume <= 0 or not price:
+            return False
+        step = float(getattr(info, "volume_step", 0.0) or 0.0) or 0.01
+        min_lot = float(getattr(info, "volume_min", 0.0) or 0.0) or 0.01
+        half = int(volume * fraction / step) * step      # round DOWN
+        half = round(half, 2)
+        if half < min_lot or (volume - half) < min_lot:
+            logger.info("PM: PARTIAL skipped — %s lots cannot be split "
+                        "(min %s, step %s)", volume, min_lot, step)
+            return False
+        request = {
+            "action": self._mt5.TRADE_ACTION_DEAL,
+            "symbol": self.symbol,
+            "volume": half,
+            "type": (getattr(self._mt5, "ORDER_TYPE_SELL", 1) if is_buy
+                     else getattr(self._mt5, "ORDER_TYPE_BUY", 0)),
+            "position": int(ticket),
+            "price": price,
+            "deviation": 20,
+            "magic": self.magic,
+            "comment": f"gold-bot pm: {rule}"[:31],
+            "type_time": getattr(self._mt5, "ORDER_TIME_GTC", 0),
+            "type_filling": (self._select_filling(info) if info else
+                             getattr(self._mt5, "ORDER_FILLING_IOC", 1)),
+        }
+        result = self._mt5.order_send(request)
+        done = getattr(self._mt5, "TRADE_RETCODE_DONE", 10009)
+        if result is None or getattr(result, "retcode", None) != done:
+            logger.warning("PM: partial close failed ticket=%s retcode=%s",
+                           ticket, getattr(result, "retcode", None))
+            return False
+        self._journal({"ticket": ticket, "side": ctx.get("side", ""),
+                       "rule": rule, "action": "PARTIAL",
+                       "price": round(price, 2),
+                       "profit": round(ctx.get("profit", 0.0), 2),
+                       "r_multiple": round(ctx.get("r_now", 0.0), 2),
+                       "old_sl": round(ctx.get("cur_sl", 0.0), 2),
+                       "new_sl": "", "old_tp": round(ctx.get("cur_tp", 0.0), 2),
+                       "new_tp": "",
+                       "reason": reason})
+        try:
+            trade_history.record_tca(
+                "EXIT", ticket, price,
+                float(getattr(result, "price", 0.0) or 0.0), half,
+                note=rule)
+            trade_history.record_close(f"{ticket}:P1", ctx.get("side", ""),
+                                       price, "PARTIAL_EXIT",
+                                       gain_pts=float(ctx.get("gain_pts",
+                                                              0.0) or 0.0),
+                                       volume=half)
+        except Exception:
+            logger.exception("PM: partial memory write failed (non-fatal)")
+        logger.info("PM: PARTIAL ticket=%s banked %.2f of %.2f lots @ %.2f "
+                    "(%s)", ticket, half, volume, price, reason)
+        return True
+
     def _close(self, position, rule: str, reason: str, ctx: dict,
                urgent: bool = False) -> bool:
         """Close one position at market. Returns True on success.
@@ -732,6 +857,19 @@ class PositionManager:
                        "new_sl": "", "old_tp": round(ctx.get("cur_tp", 0.0), 2),
                        "new_tp": "", "reason": reason})
         logger.info("PM: CLOSED ticket=%s (%s: %s)", ticket, rule, reason)
+        # v4.4: fill quality (intended vs actual) + close memory record —
+        # this feeds loss memory, the day ratchet and later AI review
+        try:
+            trade_history.record_tca(
+                "EXIT", ticket, price,
+                float(getattr(result, "price", 0.0) or 0.0), volume,
+                note=rule)
+            trade_history.record_close(
+                ticket, ctx.get("side", ""), price, rule,
+                gain_pts=float(ctx.get("gain_pts", 0.0) or 0.0),
+                volume=volume)
+        except Exception:
+            logger.exception("PM: trade memory write failed (non-fatal)")
         return True
 
     def _select_filling(self, info) -> int:
@@ -824,6 +962,7 @@ class PositionManager:
         cur_sl = float(getattr(position, "sl", 0.0) or 0.0)
         cur_tp = float(getattr(position, "tp", 0.0) or 0.0)
         profit = float(getattr(position, "profit", 0.0) or 0.0)
+        volume = float(getattr(position, "volume", 0.0) or 0.0)
 
         bid = float(getattr(tick, "bid", 0.0) or 0.0)
         ask = float(getattr(tick, "ask", 0.0) or 0.0)
@@ -918,7 +1057,18 @@ class PositionManager:
 
         ctx = {"side": side, "price": price, "profit": profit,
                "r_now": r_now, "cur_sl": cur_sl, "cur_tp": cur_tp,
+               "gain_pts": open_gain_pts, "volume": volume,
                "tick": tick, "info": info}
+
+        # v4.4: keep a trail of the last observed facts so a position that
+        # vanishes between cycles (SL/TP hit at the broker) can still be
+        # recorded in trade memory with a decent estimate
+        st["side"] = side
+        st["entry"] = float(entry)
+        st["last_gain_pts"] = float(open_gain_pts)
+        st["last_sl"] = float(cur_sl)
+        st["last_tp"] = float(cur_tp)
+        st["last_volume"] = float(volume)
 
         # ---- structural stops from the fresh snapshot ----------------------
         s_sl, s_tp, _notes = compute_structural_stops(
@@ -996,6 +1146,22 @@ class PositionManager:
                         ctx)
             return
 
+        # 3c) v4.4 PARTIAL EXIT — at +PM_PARTIAL_TRIGGER_R of risk (measured
+        # on the CURRENT price), bank half the position at market and let
+        # the runner ride with the ratchet. Automatically skipped when the
+        # position cannot be split (minimum-lot positions) or already split.
+        if (getattr(config, "PM_PARTIAL_EXIT_ENABLE", True)
+                and not st.get("partial_done", False)
+                and config.PM_PARTIAL_TRIGGER_R > 0
+                and r_now >= config.PM_PARTIAL_TRIGGER_R):
+            if self._partial_close(position, config.PM_PARTIAL_FRACTION,
+                                   "PARTIAL_EXIT",
+                                   f"+{r_now:.2f}R reached — banked half, "
+                                   f"runner keeps the ratchet", ctx):
+                st["partial_done"] = True
+                # fall through: the runner still gets this cycle's SL/TP
+                # candidates (BE / PROFIT_LOCK protect the remaining half)
+
         # ================= RULES: SL/TP UPDATES ================= #
         if now - float(st.get("last_modify_ts", 0.0)) < \
                 config.PM_MODIFY_COOLDOWN_SECONDS:
@@ -1057,14 +1223,30 @@ class PositionManager:
         # v4.3: profit ratchet — never give back more than PM_PROFIT_GIVEBACK
         # of the best gain once the trade has earned >= 1 x ATR
         if getattr(config, "PM_PROFIT_LOCK_ENABLE", True) and best_gain > 0:
-            if best_gain >= config.PM_PROFIT_LOCK_MIN_ATR * atr:
-                lock = entry + sign * best_gain * \
-                    (1.0 - config.PM_PROFIT_GIVEBACK)
+            # v4.4 adaptive lock: arm earlier and give back less when the
+            # market is a RANGE, or when the macro backdrop fights us
+            lock_min_atr = config.PM_PROFIT_LOCK_MIN_ATR
+            giveback = config.PM_PROFIT_GIVEBACK
+            if getattr(config, "PM_REGIME_ADAPTIVE", True):
+                if str(getattr(snapshot, "regime", "") or "").upper() == "RANGE":
+                    lock_min_atr = min(lock_min_atr, config.PM_REGIME_LOCK_ATR)
+                    giveback = min(giveback, config.PM_REGIME_GIVEBACK)
+            if getattr(config, "PM_MACRO_DEFENSE", True):
+                pos_sign = 1.0 if is_buy else -1.0
+                macro_bias = float(getattr(snapshot, "macro_bias", 0.0) or 0.0)
+                if (-pos_sign * macro_bias) >= config.PM_MACRO_OPP_THRESHOLD:
+                    lock_min_atr = min(lock_min_atr, config.PM_MACRO_LOCK_ATR)
+                    giveback = min(giveback, config.PM_MACRO_GIVEBACK)
+            if best_gain >= lock_min_atr * atr:
+                lock = entry + sign * best_gain * (1.0 - giveback)
                 if lock * sign > cur_sl * sign + min_step:
                     cands.append((lock, "PROFIT_LOCK",
                                   f"profit ratchet: best gain {best_gain:.1f} "
                                   f"pts — never give back more than "
-                                  f"{config.PM_PROFIT_GIVEBACK*100:.0f}%"))
+                                  f"{giveback*100:.0f}%"
+                                  + (" (adaptive: range/macro defense)" if
+                                     giveback < config.PM_PROFIT_GIVEBACK
+                                     else "")))
         if cands:
             sl_candidate, rule, reason = max(cands, key=lambda c: c[0] * sign)
         else:

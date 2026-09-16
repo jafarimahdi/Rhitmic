@@ -21,6 +21,8 @@ import csv
 import json
 import logging
 import sys
+import time
+from pathlib import Path
 from datetime import datetime
 
 import config
@@ -187,6 +189,31 @@ def setup_logging() -> None:
 def _record(step: str, status: str) -> None:
     STATUS.append((step, status))
     logger.info("%s -> %s", step, status)
+
+
+_PAUSE_LOG_TS = 0.0
+
+
+def _entries_paused() -> bool:
+    """v4.4 PAUSE FILE: a file named PAUSE next to main.py suspends NEW
+    entries (AI decision + order sending). Open positions keep being
+    MANAGED (trailing/BE/exits) and monitoring keeps running — this is a
+    pause, not a shutdown. Delete the file to resume trading.
+    How to use (Windows PowerShell, in the Gold-MT5 folder):
+        New-Item PAUSE          # pause new entries
+        Remove-Item PAUSE       # resume
+    """
+    global _PAUSE_LOG_TS
+    try:
+        paused = (Path(__file__).resolve().parent / "PAUSE").exists()
+    except Exception:
+        return False
+    if paused and (time.time() - _PAUSE_LOG_TS) > 900.0:
+        _PAUSE_LOG_TS = time.time()
+        logger.info("PAUSE file present — new entries suspended; position "
+                    "management and monitoring continue. Delete the PAUSE "
+                    "file to resume.")
+    return paused
 
 
 def _safety_gates(data) -> tuple:
@@ -767,9 +794,11 @@ def run_pipeline() -> None:
             logger.exception("STEP 2 failed")
             _record("STEP 2  MARKET ANALYSIS", f"ERROR — {exc}")
 
-    # STEP 3
+    # STEP 3 (skipped entirely when the PAUSE file exists — saves AI quota)
     decision = None
-    if snapshot is not None:
+    if _entries_paused():
+        _record("STEP 3  AI DECISION", "PAUSED — PAUSE file present")
+    elif snapshot is not None:
         try:
             decision = run_step3(snapshot)
         except Exception as exc:

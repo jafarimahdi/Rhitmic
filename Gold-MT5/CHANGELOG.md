@@ -1,5 +1,78 @@
 # Changelog
 
+## 2026-09-16 — v4.4: measurable trading (backtest + trade memory + adaptive defense)
+
+The institutional review found the robot's strategy logic sound but its
+PROCESS behind: no backtesting, no trade memory, no kill switch, and
+entry guards that trusted the signal layer too much. v4.4 closes those
+gaps in four phases. Every new feature is default-safe: on a fresh
+robot with no losses and no macro read, behavior is identical to v4.3.2
+(battery 7 proves it — 43/43).
+
+**P1 — entry quality guards (step4_mt5_execution.py)**
+- REAL RISK GUARD: refuses an entry whose actual dollar risk (lots x
+  stop distance x contract size) exceeds ENTRY_MAX_REAL_RISK_PCT (1.5%)
+  of equity. This is what protects small accounts when the broker's
+  minimum lot (0.01) is bigger than RISK_PER_TRADE_PCT wanted.
+- COST GUARD: refuses an entry whose TP distance is below
+  ENTRY_MIN_TP_SPREAD_MULT (3) spreads — a target that cannot pay the
+  toll is not a target.
+- Signal thresholds and ALL vote weights moved from code constants to
+  .env (SIGNAL_BUY_THRESHOLD, SIGNAL_SELL_THRESHOLD, SIGNAL_W_*).
+  Defaults are the same numbers the code always used — nothing changes
+  until you edit them. This is the dial set for the vote/weights tuning
+  session.
+
+**P2 — backtest harness (tools/backtest.py + docs/BACKTEST.md)**
+Replays a recorded ticks.csv through the REAL Step 2 engine and the
+REAL PositionManager on an event-time clock (no live files touched:
+state, journal and trade memory are redirected into the report folder).
+Outputs trades.csv + summary (win rate, expectancy, profit factor, max
+drawdown, PM rule frequencies). AI is OFF in replay (deterministic
+score gate) and the report says so. For exact reproducibility run with
+PYTHONHASHSEED=0.
+
+**P3 — trade memory + adaptive defense (trade_history.py, new)**
+- data/trade_memory.json: rolling ~200 closed trades, each joined with
+  its entry context (AI confidence, signal strength). data/tca_log.csv:
+  intended vs actual fill price (slippage) for every entry and exit.
+- LOSS MEMORY: after a losing trade in direction X, signals in the same
+  direction must score ENTRY_LOSS_MEMORY_SCORE_PENALTY (5) points higher
+  for ENTRY_LOSS_MEMORY_MINUTES (30). Don't poke the same fire twice.
+- DAY RATCHET: on a losing day the entry bar rises: -1% -> +5 points,
+  -2% -> +10 (protects the daily-loss halt budget).
+- PARTIAL EXITS: at +PM_PARTIAL_TRIGGER_R (1.0R) the PM banks half the
+  position at market and lets the runner ride with the ratchet.
+  Positions too small to split (0.01 lots) skip this automatically.
+- REGIME-ADAPTIVE LOCK: when Step 2 says RANGE, the profit ratchet arms
+  earlier (0.75 x ATR) and gives back less (40%).
+- MACRO DEFENSE: when the macro backdrop (DXY/yields/VIX) fights the
+  position by >= PM_MACRO_OPP_THRESHOLD (0.3), same tighter treatment.
+  The bias travels on the new snapshot field macro_bias (-1..+1).
+- GONE-POSITION DETECTION: a position that vanishes between cycles (SL/TP
+  hit at the broker) is now recorded via MT5 deal history (exact PnL) —
+  this is what makes loss memory complete.
+
+**P4 — observability + kill switch**
+- PAUSE FILE: create a file named PAUSE next to main.py -> new entries
+  stop (AI + Step 4 skipped, saving AI quota); open positions keep being
+  managed and monitoring keeps running. Delete the file to resume.
+- TCA logging wired into step4 entries, PM closes and partial closes.
+- PM journal rows are now timestamped (was an empty column since v4).
+
+**Files changed:** config.py, step2_market_analysis.py,
+step4_mt5_execution.py, position_manager.py, main.py,
+.env.example, CHANGELOG.md, docs/POSITION_MANAGER.md,
+docs/BACKTEST.md (new), trade_history.py (new), tools/backtest.py (new).
+
+**Tests (battery 7, 43 checks):** PM core regression (ratchet, momentum
+exit, time stop, flip exit, cooldown, tighten-only) + partial exits +
+regime/macro adaptive lock + loss memory/day ratchet + gone detection +
+TCA + .env weight plumbing + step4 guards through the full execute()
+path + backtest harness end-to-end on 113k synthetic events. Compile-all
+clean; full pipeline run clean.
+
+
 ## 2026-09-15 — v4.3.2: Gemini key slots up to 20
 
 The user added a 6th key — the old code only read GEMINI_API_KEY_2.._5,

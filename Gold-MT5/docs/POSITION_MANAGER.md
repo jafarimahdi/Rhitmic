@@ -1,5 +1,11 @@
 # Position Manager (v4) — the robot no longer "opens and forgets"
 
+**Version 4.4 adds measurable trading** — partial exits (bank half at
++1R, runner rides the ratchet), an adaptive profit lock (RANGE markets
+and macro-fighting trades lock earlier and give back less), and trade
+memory (every close recorded with its context; recent losses raise the
+entry bar).
+
 **Version 4.2 adds the risk perimeter** — protection against the three
 things no stop-loss can save you from: scheduled news shocks, the daily
 market gap, and spiked spreads at the worst moment.
@@ -56,6 +62,25 @@ first cycle after you deploy). Rules, in evaluation order:
 | **PROFIT_LOCK** | Open gain has reached ≥ 1×ATR | Ratchet: SL never gives back more than 50% of the **best** gain — winners close as winners |
 | **MOMENTUM_EXIT** | Profitable position + flow health "against" + signal ≥ 40 against | Close AT MARKET immediately — no waiting for the TP or giving profit back to the trail |
 | **TP_UPDATE** | New opposing structure formed | TP front-runs it (may only move *further away* once break-even) |
+| **PARTIAL_EXIT** (v4.4) | Profit reached +`PM_PARTIAL_TRIGGER_R` (1.0R) on the CURRENT price | Bank half the position at market (`PM_PARTIAL_FRACTION`); the runner keeps the ratchet. Skipped automatically when the position cannot be split (0.01 lots = broker minimum) |
+
+**Adaptive profit lock (v4.4).** The PROFIT_LOCK ratchet adapts to
+conditions — in a RANGE market (Step 2's regime call) or when the macro
+backdrop (DXY/yields/VIX via the snapshot's `macro_bias`) fights the
+position by ≥ 0.3, the ratchet arms at 0.75×ATR instead of 1.0×ATR and
+gives back only 40% instead of 50%. In a range, money left on the table
+rarely comes back through the door; when fighting macro, take what the
+market gives quickly. Both adapters are switches (`PM_REGIME_ADAPTIVE`,
+`PM_MACRO_DEFENSE`) and both only ever TIGHTEN — never loosen.
+
+**Trade memory (v4.4).** Every entry and every close (rule exit, SL/TP
+hit at the broker — detected via deal history — or manual close) is
+recorded in `data/trade_memory.json` with its entry context (AI
+confidence, signal strength). The entry side reads it back: a recent
+same-direction loss raises the entry bar by +5 points for 30 minutes
+(loss memory), and a losing day raises it further (-1% → +5, -2% → +10,
+the day ratchet). Fill quality (intended vs actual price) lands in
+`data/tca_log.csv`.
 
 **The spread guard** runs under all of it: while the CFD spread exceeds
 `PM_ACTION_MAX_SPREAD_PCT` (0.05%), SL/TP edits and non-urgent closes are

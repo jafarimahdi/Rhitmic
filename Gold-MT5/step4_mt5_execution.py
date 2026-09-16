@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover
     mt5 = None
 
 import config
+import trade_history
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +172,9 @@ class MT5Executor:
                 symbol=self.symbol, timestamp=now)
 
         try:
-            return self._place_order(decision.action, snapshot, news_state)
+            return self._place_order(decision.action, snapshot, news_state,
+                                     ai_confidence=float(
+                                         getattr(decision, "confidence", 0.0)))
         finally:
             mt5.shutdown()
 
@@ -383,7 +386,8 @@ class MT5Executor:
         return None
 
     def _place_order(self, action: str, snapshot,
-                     news_state: str) -> ExecutionResult:
+                     news_state: str,
+                     ai_confidence: float = 0.0) -> ExecutionResult:
         """Send a market order with SL/TP. (Runs only when MT5 is available.)"""
         now = datetime.now(timezone.utc)
         tick = mt5.symbol_info_tick(self.symbol)
@@ -408,6 +412,45 @@ class MT5Executor:
                           f"{config.MAX_SPREAD_PCT:.3f}% — DEFERRED")
                 logger.warning("STEP 4: %s", reason)
                 return ExecutionResult(status="DEFERRED", reason=reason,
+                                       symbol=self.symbol, price=price,
+                                       timestamp=now)
+
+        # v4.4 MEMORY GATE: recent same-direction loss and/or a losing day
+        # raise the entry bar. Fresh robot, no losses, winning day -> this
+        # gate is a no-op (bar stays where Step 2 put it).
+        mem_penalty = 0.0
+        mem_notes = []
+        if config.ENTRY_LOSS_MEMORY_MINUTES > 0:
+            loss = trade_history.recent_loss(
+                action, config.ENTRY_LOSS_MEMORY_MINUTES)
+            if loss["hit"]:
+                mem_penalty += config.ENTRY_LOSS_MEMORY_SCORE_PENALTY
+                mem_notes.append(
+                    f"recent {action} loss {loss['minutes_ago']:.0f}m ago "
+                    f"({loss['reason']}) -> bar +"
+                    f"{config.ENTRY_LOSS_MEMORY_SCORE_PENALTY:.0f}")
+        if config.ENTRY_DAY_RATCHET_ENABLE:
+            equity_now = float(self._account_equity() or 0.0)
+            day_pct = trade_history.day_pnl_pct(equity_now) if equity_now > 0 \
+                else 0.0
+            if equity_now > 0 and day_pct <= -abs(config.ENTRY_RATCHET_2_PCT):
+                mem_penalty += config.ENTRY_RATCHET_2_PENALTY
+                mem_notes.append(f"day {day_pct:+.2f}% -> bar +"
+                                 f"{config.ENTRY_RATCHET_2_PENALTY:.0f}")
+            elif day_pct <= -abs(config.ENTRY_RATCHET_1_PCT):
+                mem_penalty += config.ENTRY_RATCHET_1_PENALTY
+                mem_notes.append(f"day {day_pct:+.2f}% -> bar +"
+                                 f"{config.ENTRY_RATCHET_1_PENALTY:.0f}")
+        if mem_penalty > 0:
+            base_bar = (config.SIGNAL_BUY_THRESHOLD if is_buy
+                        else abs(config.SIGNAL_SELL_THRESHOLD))
+            score = float(getattr(snapshot, "signal_strength", 0.0) or 0.0)
+            score_signed = score if is_buy else -score
+            if score_signed < base_bar + mem_penalty:
+                reason = (f"score {score_signed:+.0f} below raised bar "
+                          f"{base_bar + mem_penalty:+.0f} ({'; '.join(mem_notes)})")
+                logger.info("STEP 4: SKIPPED — %s", reason)
+                return ExecutionResult(status="SKIPPED", reason=reason,
                                        symbol=self.symbol, price=price,
                                        timestamp=now)
 
@@ -485,6 +528,40 @@ class MT5Executor:
             lot_size = lot_size * config.NEWS_REDUCE_SIZE_PCT  # shrink during news
         lot_size = self._normalize_volume(lot_size, info)
 
+        # v4.4 COST GUARD: a target closer than ENTRY_MIN_TP_SPREAD_MULT
+        # spreads cannot pay the toll. Skip — there will be another bus.
+        if (config.ENTRY_MIN_TP_SPREAD_MULT > 0 and tp > 0
+                and tick.bid > 0 and tick.ask > 0):
+            spread = tick.ask - tick.bid
+            tp_distance = abs(tp - price)
+            if tp_distance < config.ENTRY_MIN_TP_SPREAD_MULT * spread:
+                reason = (f"TP too close to pay the toll: target "
+                          f"{tp_distance:.2f} pts < "
+                          f"{config.ENTRY_MIN_TP_SPREAD_MULT:.1f} x spread "
+                          f"{spread:.2f} pts")
+                logger.info("STEP 4: SKIPPED — %s", reason)
+                return ExecutionResult(status="SKIPPED", reason=reason,
+                                       symbol=self.symbol, price=price,
+                                       sl=sl, tp=tp, timestamp=now)
+
+        # v4.4 REAL-RISK GUARD: with a minimum lot forced by the broker,
+        # the ACTUAL dollar risk can be far above RISK_PER_TRADE_PCT (e.g.
+        # 0.01 lots on a $670 account with a wide stop). Refuse instead of
+        # quietly over-risking.
+        if config.ENTRY_MAX_REAL_RISK_PCT > 0 and equity > 0 and lot_size > 0:
+            real_risk_usd = lot_size * stop_distance * config.CONTRACT_SIZE
+            max_risk_usd = equity * config.ENTRY_MAX_REAL_RISK_PCT / 100.0
+            if real_risk_usd > max_risk_usd:
+                reason = (f"real risk ${real_risk_usd:.2f} > "
+                          f"{config.ENTRY_MAX_REAL_RISK_PCT:.2f}% of equity "
+                          f"(${max_risk_usd:.2f}) at min lot "
+                          f"{lot_size:.2f} / stop {stop_distance:.1f} pts")
+                logger.info("STEP 4: SKIPPED — %s", reason)
+                return ExecutionResult(status="SKIPPED", reason=reason,
+                                       symbol=self.symbol, price=price,
+                                       sl=sl, tp=tp, volume=lot_size,
+                                       timestamp=now)
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": self.symbol,
@@ -551,6 +628,26 @@ class MT5Executor:
                     "order=%s deal=%s position=%s", action, self.symbol,
                     lot_size, price, sl, tp, order_id, deal_id,
                     getattr(verified_position, "ticket", None))
+        # v4.4: remember the trade context (for loss memory + review) and
+        # log the fill quality (intended vs actual price = slippage).
+        try:
+            ticket = getattr(verified_position, "ticket", None)
+            trade_history.record_entry(
+                ticket, action, price, sl, tp, lot_size,
+                ai_confidence=ai_confidence,
+                signal_strength=float(getattr(snapshot, "signal_strength",
+                                              0.0) or 0.0),
+                signal_score=float(getattr(snapshot, "signal_strength",
+                                           0.0) or 0.0))
+            fill_price = float(getattr(result, "price", 0.0) or 0.0)
+            if fill_price <= 0:
+                fill_price = float(getattr(verified_position, "price_open",
+                                           0.0) or 0.0)
+            trade_history.record_tca("ENTRY", ticket, price, fill_price,
+                                     lot_size, note=action)
+        except Exception:
+            logger.exception("STEP 4: trade memory/tca write failed "
+                             "(non-fatal)")
         return ExecutionResult(status="EXECUTED", order_id=order_id,
                                deal_id=deal_id,
                                position_id=getattr(verified_position, "ticket", None),

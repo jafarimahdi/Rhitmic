@@ -278,6 +278,88 @@ def _refresh() -> None:
     g["PM_MOMENTUM_MIN_R"] = _ffloat("PM_MOMENTUM_MIN_R", 0.3)
     g["PM_MOMENTUM_SIGNAL"] = _ffloat("PM_MOMENTUM_SIGNAL", 40.0)
 
+    # ---- v4.4 PM upgrades: partial exits + adaptive defense ----
+    # PARTIAL EXIT: at +PM_PARTIAL_TRIGGER_R of risk (measured on the
+    # CURRENT price, not the best high-water), close PM_PARTIAL_FRACTION
+    # of the position at market and let the runner work with the ratchet.
+    # Skipped automatically when the position is too small to split
+    # (e.g. 0.01 lots = the broker minimum) — nothing changes for them.
+    g["PM_PARTIAL_EXIT_ENABLE"] = _fget("PM_PARTIAL_EXIT_ENABLE", "1") == "1"
+    g["PM_PARTIAL_TRIGGER_R"] = _ffloat("PM_PARTIAL_TRIGGER_R", 1.0)
+    g["PM_PARTIAL_FRACTION"] = _ffloat("PM_PARTIAL_FRACTION", 0.5)
+    # REGIME-ADAPTIVE LOCK: when Step 2 says the market is a RANGE, the
+    # profit ratchet arms earlier (0.75 x ATR instead of 1.0) and gives
+    # back less (40% instead of 50%) — in a range, money left on the
+    # table comes back through the door less often.
+    g["PM_REGIME_ADAPTIVE"] = _fget("PM_REGIME_ADAPTIVE", "1") == "1"
+    g["PM_REGIME_LOCK_ATR"] = _ffloat("PM_REGIME_LOCK_ATR", 0.75)
+    g["PM_REGIME_GIVEBACK"] = _ffloat("PM_REGIME_GIVEBACK", 0.40)
+    # MACRO DEFENSE: when the macro backdrop (DXY/yields/VIX) is against
+    # the position by >= this bias (0..1), same tighter-lock treatment.
+    g["PM_MACRO_DEFENSE"] = _fget("PM_MACRO_DEFENSE", "1") == "1"
+    g["PM_MACRO_OPP_THRESHOLD"] = _ffloat("PM_MACRO_OPP_THRESHOLD", 0.3)
+    g["PM_MACRO_LOCK_ATR"] = _ffloat("PM_MACRO_LOCK_ATR", 0.75)
+    g["PM_MACRO_GIVEBACK"] = _ffloat("PM_MACRO_GIVEBACK", 0.40)
+
+    # ---- v4.4 entry quality guards (step 4) ----
+    # REAL RISK GUARD: refuse an entry whose actual dollar risk (lot size
+    # x stop distance x contract size) exceeds this % of equity. This is
+    # what protects small accounts when the broker forces a minimum lot
+    # bigger than RISK_PCT wanted.
+    g["ENTRY_MAX_REAL_RISK_PCT"] = _ffloat("ENTRY_MAX_REAL_RISK_PCT", 1.5)
+    # COST GUARD: refuse an entry whose TP distance is smaller than this
+    # multiple of the CURRENT spread — a target that doesn't pay the toll
+    # is not a target.
+    g["ENTRY_MIN_TP_SPREAD_MULT"] = _ffloat("ENTRY_MIN_TP_SPREAD_MULT", 3.0)
+    # LOSS MEMORY: after a losing trade in direction X, signals in the
+    # SAME direction must score this many points HIGHER for this many
+    # minutes (the "don't poke the same fire twice" rule).
+    g["ENTRY_LOSS_MEMORY_MINUTES"] = _ffloat("ENTRY_LOSS_MEMORY_MINUTES", 30.0)
+    g["ENTRY_LOSS_MEMORY_SCORE_PENALTY"] = _ffloat(
+        "ENTRY_LOSS_MEMORY_SCORE_PENALTY", 5.0)
+    # DAY RATCHET: on a losing day, the entry bar rises — after -1% the
+    # bar is +5 points, after -2% it is +10 (protects the daily-loss halt
+    # budget; measured from the robot's own close records, UTC day).
+    g["ENTRY_DAY_RATCHET_ENABLE"] = _fget("ENTRY_DAY_RATCHET_ENABLE", "1") == "1"
+    g["ENTRY_RATCHET_1_PCT"] = _ffloat("ENTRY_RATCHET_1_PCT", 1.0)
+    g["ENTRY_RATCHET_1_PENALTY"] = _ffloat("ENTRY_RATCHET_1_PENALTY", 5.0)
+    g["ENTRY_RATCHET_2_PCT"] = _ffloat("ENTRY_RATCHET_2_PCT", 2.0)
+    g["ENTRY_RATCHET_2_PENALTY"] = _ffloat("ENTRY_RATCHET_2_PENALTY", 10.0)
+
+    # ---- v4.4 signal weights (the votes, tunable from .env) ----
+    # These are the SAME numbers Step 2 always used — they are just
+    # readable/editable now. Raise a weight = listen to that voter more.
+    # Thresholds: score must reach +BUY (default 15) / -SELL to trade.
+    g["SIGNAL_BUY_THRESHOLD"] = _ffloat("SIGNAL_BUY_THRESHOLD", 15.0)
+    g["SIGNAL_SELL_THRESHOLD"] = _ffloat("SIGNAL_SELL_THRESHOLD", -15.0)
+    # multi-timeframe confirmation
+    g["SIGNAL_W_H1"] = _ffloat("SIGNAL_W_H1", 1.0)
+    g["SIGNAL_W_M15"] = _ffloat("SIGNAL_W_M15", 0.8)
+    g["SIGNAL_W_M5"] = _ffloat("SIGNAL_W_M5", 0.6)
+    # trend / momentum voters
+    g["SIGNAL_W_TREND"] = _ffloat("SIGNAL_W_TREND", 0.5)
+    g["SIGNAL_W_MACD"] = _ffloat("SIGNAL_W_MACD", 0.6)
+    g["SIGNAL_W_EMA_CROSS"] = _ffloat("SIGNAL_W_EMA_CROSS", 0.5)
+    g["SIGNAL_W_SMA50"] = _ffloat("SIGNAL_W_SMA50", 0.7)
+    g["SIGNAL_W_SMA20"] = _ffloat("SIGNAL_W_SMA20", 0.5)
+    # order-flow voters
+    g["SIGNAL_W_PRESSURE"] = _ffloat("SIGNAL_W_PRESSURE", 0.8)
+    g["SIGNAL_W_CVD"] = _ffloat("SIGNAL_W_CVD", 0.6)
+    g["SIGNAL_W_BIDASK"] = _ffloat("SIGNAL_W_BIDASK", 0.6)
+    g["SIGNAL_W_OFI"] = _ffloat("SIGNAL_W_OFI", 0.9)
+    g["SIGNAL_W_DEPTH"] = _ffloat("SIGNAL_W_DEPTH", 0.7)
+    g["SIGNAL_W_MICRO"] = _ffloat("SIGNAL_W_MICRO", 0.5)
+    g["SIGNAL_W_ABSORB"] = _ffloat("SIGNAL_W_ABSORB", 0.5)
+    # footprint + level-3 voters
+    g["SIGNAL_W_FOOTPRINT"] = _ffloat("SIGNAL_W_FOOTPRINT", 0.7)
+    g["SIGNAL_W_L3_IMB"] = _ffloat("SIGNAL_W_L3_IMB", 0.6)
+    g["SIGNAL_W_L3_OFI"] = _ffloat("SIGNAL_W_L3_OFI", 0.8)
+    g["SIGNAL_W_L3_AGGR"] = _ffloat("SIGNAL_W_L3_AGGR", 0.8)
+    # CVD divergence (the heaviest single vote in the system)
+    g["SIGNAL_W_DIVERGENCE"] = _ffloat("SIGNAL_W_DIVERGENCE", 1.2)
+    # VWAP side vote
+    g["SIGNAL_W_VWAP"] = _ffloat("SIGNAL_W_VWAP", 0.6)
+
     # ---- live news headlines (fed to the AI so it can weigh fundamentals) ----
     # FREE via Google News RSS — no key, no card needed. 0 disables it.
     g["NEWS_ENABLED"] = _fget("NEWS_ENABLED", "1") == "1"
