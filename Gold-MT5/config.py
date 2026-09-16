@@ -189,6 +189,7 @@ def _refresh() -> None:
     g["NEWS_WARNING_MINUTES"] = _ffloat("NEWS_WARNING_MINUTES", 30.0)
     g["NEWS_BLACKOUT_BEFORE_MINUTES"] = _ffloat("NEWS_BLACKOUT_BEFORE_MINUTES", 15.0)
     g["NEWS_BLACKOUT_AFTER_MINUTES"] = _ffloat("NEWS_BLACKOUT_AFTER_MINUTES", 30.0)
+    g["NEWS_PERIMETER_IGNORE_LOW"] = _fget("NEWS_PERIMETER_IGNORE_LOW", "1") == "1"  # v4.4.2: LOW-impact events never gate trading
     g["NEWS_WIDEN_STOP_MULT"] = _ffloat("NEWS_WIDEN_STOP_MULT", 1.5)
     g["NEWS_REDUCE_SIZE_PCT"] = _ffloat("NEWS_REDUCE_SIZE_PCT", 0.5)
 

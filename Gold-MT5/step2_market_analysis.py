@@ -1301,6 +1301,11 @@ class NewsAnalyzer:
 # ----------------------------------------------------------------------------- #
 
 
+# v4.4.2: bump when the cached-event format changes, so old caches are
+# treated as stale and refetched immediately
+_CALENDAR_CACHE_VERSION = 2
+
+
 class EconomicCalendar:
     """Upcoming economic events + a news-time state machine.
 
@@ -1328,6 +1333,8 @@ class EconomicCalendar:
         try:
             if path.exists():
                 state = json.loads(path.read_text(encoding="utf-8"))
+                if state.get("v") != _CALENDAR_CACHE_VERSION:
+                    return [], False     # v4.4.2: old-format cache is stale
                 events = state.get("events") or []
                 fetched = float(state.get("fetched_at", 0) or 0)
                 fresh = bool(events) and (time.time() - fetched) < 3600.0
@@ -1341,8 +1348,9 @@ class EconomicCalendar:
         path = Path(__file__).resolve().parent / "data" / "calendar_cache.json"
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"fetched_at": time.time(),
-                                        "events": events}), encoding="utf-8")
+            path.write_text(json.dumps(
+                {"v": _CALENDAR_CACHE_VERSION, "fetched_at": time.time(),
+                 "events": events}), encoding="utf-8")
         except OSError:
             pass
 
@@ -1361,8 +1369,17 @@ class EconomicCalendar:
                                     headers={"User-Agent": "market-analysis/2.0"})
                 resp.raise_for_status()
                 data = resp.json()
-                events: List[Dict] = []
-                for item in data[: max_events * 2]:
+                # v4.4.2: the week file starts on SUNDAY. The old code took
+                # the FIRST max_events items, so by mid-week every event was
+                # days old, news_state() saw nothing upcoming, and the news
+                # perimeter (WARNING / BLACKOUT / PM tighten) was stuck in
+                # QUIET all week. Keep only events that have not long
+                # passed, sort by event time, THEN take the first N (the
+                # nearest upcoming ones).
+                now = datetime.now(timezone.utc)
+                keep_from = now - timedelta(hours=2)  # let just-released events finish their window
+                parsed_events: List[Tuple[Optional[datetime], Dict]] = []
+                for item in data:
                     title = str(item.get("title", "") or item.get("event", "") or "").strip()
                     if not title:
                         continue
@@ -1373,16 +1390,20 @@ class EconomicCalendar:
                         impact = "MEDIUM"
                     else:
                         impact = "LOW"
-                    events.append({
+                    event = {
                         "title": title,
                         "country": str(item.get("country", "") or ""),
                         "impact": impact,
                         "date": str(item.get("date", "") or ""),
                         "forecast": item.get("forecast", ""),
                         "previous": item.get("previous", ""),
-                    })
-                    if len(events) >= max_events:
-                        break
+                    }
+                    dt = self._parse_event_time(event["date"], now)
+                    if dt is None or dt >= keep_from:
+                        parsed_events.append((dt, event))
+                far_future = datetime.max.replace(tzinfo=timezone.utc)
+                parsed_events.sort(key=lambda p: p[0] or far_future)
+                events = [e for _, e in parsed_events[:max_events]]
                 self._write_cached_events(events)
                 return events
             except Exception as exc:
@@ -1470,8 +1491,20 @@ class EconomicCalendar:
         if not events:
             return "QUIET", 0.0, ""
 
+        # v4.4.2: LOW-impact events (housing data, bond auctions, speeches)
+        # must never gate trading — the perimeter is for events that move
+        # gold. Tunable: NEWS_PERIMETER_IGNORE_LOW=0 in .env restores the
+        # old react-to-everything behavior.
+        ignore_low = True
+        try:
+            ignore_low = getattr(config, "NEWS_PERIMETER_IGNORE_LOW", True)
+        except Exception:
+            pass
+
         timed = []
         for e in events:
+            if ignore_low and str(e.get("impact", "")).upper() == "LOW":
+                continue
             dt = self._parse_event_time(e.get("date"), now)
             if dt is not None:
                 timed.append((dt, e))

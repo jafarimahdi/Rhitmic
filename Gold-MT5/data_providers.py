@@ -58,6 +58,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -79,35 +80,84 @@ class ProviderNotAvailable(RuntimeError):
 # ============================================================================= #
 
 def trades_to_candles(trades: List[Dict], timeframe: str = "1min") -> Dict[str, np.ndarray]:
-    """Resample a list of {timestamp, price, volume} trades into OHLCV candles.
+    """Aggregate a list of {timestamp, price, volume} trades into OHLCV candles.
 
-    Returns numpy arrays (or {} if there is nothing to resample).
+    v4.4.1: rewritten without pandas. The old implementation used
+    pd.to_datetime(..., errors="coerce"), which infers ONE timestamp format
+    and silently coerces every string that does not match it to NaT. Real
+    NT bridge data mixes ISO strings WITH microseconds ("...:34.123000+02:00")
+    and WITHOUT ("...:34+02:00" - events stamped exactly on a whole second).
+    On live recordings pandas could lock onto the rare variant and drop
+    ~99% of trades, collapsing hours of data into 2-3 candles (technicals,
+    MTF, order blocks and HTF POC stayed asleep). This version parses every
+    element with datetime.fromisoformat (accepts both variants) and buckets
+    by wall-clock epoch, so candle history no longer depends on the pandas
+    version or the timestamp mix.
+
+    Semantics (unchanged): one candle per `timeframe` bucket that contains
+    at least one trade, ordered oldest -> newest; empty minutes are skipped
+    (same as the old resample().dropna()).
     """
     if not trades:
         return {}
-    try:
-        import pandas as pd
-    except ImportError:  # pragma: no cover
-        logger.warning("pandas not installed -> candles not built from trades")
-        return {}
+    m = re.match(r"^\s*(\d+)\s*min", str(timeframe or "1min"), re.IGNORECASE)
+    bucket = (max(1, int(m.group(1))) * 60) if m else 60
 
-    df = pd.DataFrame(trades)
-    if "timestamp" not in df.columns:
+    rows: List[Tuple[int, float, float]] = []
+    for tr in trades:
+        ts = tr.get("timestamp")
+        dt: Optional[datetime] = None
+        if isinstance(ts, datetime):
+            dt = ts
+        elif isinstance(ts, str):
+            try:
+                dt = datetime.fromisoformat(ts.strip())
+            except ValueError:
+                continue
+        if dt is None:
+            continue
+        if dt.tzinfo is None:          # naive -> assume local (bridge writes local)
+            try:
+                dt = dt.astimezone()
+            except (OSError, ValueError):
+                pass
+        try:
+            price = float(tr.get("price"))
+            size = float(tr.get("volume") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        rows.append((dt.timestamp(), price, size))
+    if not rows:
         return {}
-    df["ts"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    df = df.dropna(subset=["ts"]).set_index("ts")
-    if df.empty:
-        return {}
-    price = df["price"].astype(float)
-    volume = df["volume"].astype(float)
-    ohlc = price.resample(timeframe).ohlc().dropna()  # drop minutes with no trades (NaN rows)
-    vol = volume.resample(timeframe).sum().reindex(ohlc.index).fillna(0.0)
+    rows.sort(key=lambda r: r[0])      # full time order (not just bucket) -> correct OHLC
+
+    o: List[float] = []
+    h: List[float] = []
+    l: List[float] = []
+    c: List[float] = []
+    v: List[float] = []
+    cur: Optional[int] = None
+    for epoch, price, size in rows:
+        key = int(epoch // bucket)
+        if key != cur:
+            o.append(price)
+            h.append(price)
+            l.append(price)
+            c.append(price)
+            v.append(0.0)
+            cur = key
+        if price > h[-1]:
+            h[-1] = price
+        if price < l[-1]:
+            l[-1] = price
+        c[-1] = price
+        v[-1] += size
     return {
-        "open": ohlc["open"].to_numpy(dtype=float),
-        "high": ohlc["high"].to_numpy(dtype=float),
-        "low": ohlc["low"].to_numpy(dtype=float),
-        "close": ohlc["close"].to_numpy(dtype=float),
-        "volume": vol.to_numpy(dtype=float),
+        "open": np.asarray(o, dtype=float),
+        "high": np.asarray(h, dtype=float),
+        "low": np.asarray(l, dtype=float),
+        "close": np.asarray(c, dtype=float),
+        "volume": np.asarray(v, dtype=float),
     }
 
 

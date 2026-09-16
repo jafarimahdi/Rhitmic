@@ -1,5 +1,61 @@
 # Changelog
 
+## 2026-09-16 — v4.4.2: news perimeter revived (stale-calendar bug)
+
+**Bug:** `NEWS STATE` was stuck on `QUIET — next event in 0 min (none)` all
+week, so WARNING/BLACKOUT never fired and the robot could trade straight
+through CPI/NFP/FOMC releases. Two flaws, both hidden until a live calendar
+was actually inspected:
+
+1. **Stale event slice.** The ForexFactory week file starts on SUNDAY, and
+   `fetch_live_events()` kept the FIRST 20 events — by Wednesday all of
+   them were days old. `news_state()` correctly saw "nothing upcoming".
+   Fix: keep only events not long passed (now − 2h tail), sort by event
+   time, then take the nearest 20. The calendar cache is versioned (v=2)
+   so an old cache is refetched immediately.
+2. **LOW events gated trading.** Once the slice was fixed, the state
+   machine would have blacked out around LOW-impact events (CAD housing
+   starts, bond auctions). Fix: LOW-impact events are skipped by the
+   perimeter (tunable via NEWS_PERIMETER_IGNORE_LOW=0).
+
+**Verified** against the live feed with simulated clocks: US Retail Sales
+(MEDIUM) correctly produces WARNING at T−30 and BLACKOUT at T−15; FOMC
+(HIGH) WARNING 19:30 local, BLACKOUT through the press conference; LOW
+events produce nothing. The snapshot's "Event:" line and the countdown now
+show the real next event. No .env changes required (new key defaults on).
+
+
+## 2026-09-16 — v4.4.1: candle warm-up fix (pandas timestamp trap)
+
+**Bug:** on fresh live recordings the robot reported "candle history
+shallow (2-3 M1 bars)" no matter how long it ran — roughly one candle
+per ~1000 trades. Everything candle-based (ATR, SMA/RSI, MTF
+confirmation, order blocks, HTF POC, regime) stayed asleep while order
+flow worked normally.
+
+**Root cause:** trades_to_candles() used pd.to_datetime(...,
+errors="coerce"). NT bridge data mixes ISO timestamps WITH microseconds
+("...:34.123000+02:00") and WITHOUT ("...:34+02:00" — events stamped
+exactly on a whole second). pandas infers ONE format and silently
+coerces every non-matching string to NaT — on real MGC recordings it
+locked onto the rare whole-second variant and dropped ~99% of trades
+before candle building. The coercion is silent and depends on the data
+mix and pandas version, which is why synthetic test data (uniform
+timestamps) never triggered it.
+
+**Fix:** trades_to_candles() rewritten without pandas — every timestamp
+is parsed with datetime.fromisoformat (accepts both variants) and
+candles are bucketed by wall-clock epoch. Same semantics as before (one
+candle per minute-with-trades, oldest -> newest; empty minutes skipped).
+Verified on pandas 2.2.3 and 3.0.5 with mixed-format data that collapsed
+to 2-3 bars before the fix; unsorted input and edge cases covered.
+
+**Effect:** candle history now warms up in real time (~1 bar per
+minute); after a restart the first cycle shows the whole day's bars
+immediately (the tailer re-reads ticks.csv). tools/backtest.py imports
+the same function, so backtests get real candles too. No config, .env,
+or NinjaTrader changes.
+
 ## 2026-09-16 — v4.4: measurable trading (backtest + trade memory + adaptive defense)
 
 The institutional review found the robot's strategy logic sound but its
